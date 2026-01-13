@@ -1,0 +1,614 @@
+"""
+Channel Propagation Model - ITU-R P.526 Version (多频率支持版)
+- 区分三种链路类型：地-地 / 地-空(空-地) / 空-空
+- 空对空链路：额外固定dB 损耗
+- 地-空/空-地链路：额外固定损耗（极化、空域环境等综合损耗）
+- 空-地链路：在靠近地面端的路径段上加入简化地形绕射损耗（基于 ITU-R P.526 刃形模型）
+"""
+
+import json
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+import random
+
+random.seed(42)
+np.random.seed(42)
+
+# ==================== 系统常量 ====================
+SIGMA_SHADOW = 7.0          # 阴影衰落标准差 (dB)
+SAMPLE_INTERVAL = 100.0     # 地形采样间距 (m)
+ALTITUDE_THRESHOLD = 2000.0 # 空对地链路高度阈值 (m)
+
+BOUNDARY_MARGIN = 0.01      # 端点裕度
+OVERLAP_THRESHOLD_1 = 0.05  # 强耦合阈值
+OVERLAP_THRESHOLD_2 = 0.1   # 中耦合阈值
+FRESNEL_THRESHOLD = -0.78   # ITU-R P.526 Fresnel忽略阈值
+
+# 额外损耗（dB）
+EXTRA_LOSS_AIR_AIR = 21.0   # 空-空链路固定增加 21 dB
+EXTRA_LOSS_AIR_GROUND = 12.0 # 地-空 / 空-地 链路固定增加 12 dB
+
+# 空-地链路地形绕射控制参数
+AG_NEAR_PORTION = 0.3       # 仅考虑靠近地面端的这部分路径 (0~1 之间，可调)
+AG_DIFF_SCALE = 0.8         
+AG_DIFF_CAP = 14.0          # 空-地链路绕射损耗上限 (dB)
+
+# ==================== 数据结构定义 ====================
+@dataclass
+class Position:
+   """位置信息（支持多频率）"""
+   x: float  # 水平坐标 X (km)
+   y: float  # 水平坐标 Y (km)
+   z: float  # 总高度 (m) = 地形海拔 + 天线高度
+   terrain_elevation: float = 0.0  # 地形海拔 (m)
+   antenna_height: float = 0.0     # 天线高度 (m)
+   frequency: float = 600.0        # 工作频率 (MHz)
+
+@dataclass
+class TerrainCell:
+   """地形单元"""
+   row: int
+   col: int
+   elevation: float      # 地形海拔 (m)
+   center_x: float       # 中心X坐标 (km)
+   center_y: float       # 中心Y坐标 (km)
+
+@dataclass
+class Obstacle:
+   """障碍物信息"""
+   cell_id: Tuple[int, int]  # 单元ID
+   t_critical: float         # 临界位置（归一化）
+   h_obs: float              # 有效障碍物高度 (m)
+   nu: float                 # Fresnel参数
+   L: float                  # 单元单独损耗 (dB)
+
+# ==================== 地形加载器 ====================
+class TerrainLoader:
+   """地形数据加载与查询"""
+
+   def __init__(self, json_path: str):
+       with open(json_path, 'r', encoding='utf-8') as f:
+           self.data = json.load(f)
+       self.metadata = self.data['metadata']
+       self.cells: Dict[Tuple[int, int], TerrainCell] = {}
+
+       # 加载所有六边形单元
+       for key, cell_data in self.data['hex_cells'].items():
+           row, col = map(int, key.split(','))
+           self.cells[(row, col)] = TerrainCell(
+               row=row,
+               col=col,
+               elevation=cell_data['elevation'],
+               center_x=cell_data['center_x'],
+               center_y=cell_data['center_y']
+           )
+       print(f" 地形加载完成: {len(self.cells)} 个六边形单元")
+
+   def get_cell_by_position(self, x: float, y: float) -> Optional[TerrainCell]:
+       """
+       根据坐标查询最近的地形单元
+
+       Args:
+           x, y: 坐标 (km)
+
+       Returns:
+           最近的TerrainCell对象，若不在范围内则返回None
+       """
+       min_dist = float('inf')
+       nearest_cell = None
+       for cell in self.cells.values():
+           dist = np.sqrt((x - cell.center_x)**2 + (y - cell.center_y)**2)
+           if dist < min_dist:
+               min_dist = dist
+               nearest_cell = cell
+       return nearest_cell
+
+   def create_position(
+       self,
+       x: float,
+       y: float,
+       antenna_height: float,
+       frequency: float = 600.0  # 默认600 MHz
+   ) -> Position:
+       """
+       从地形数据创建位置对象
+
+       Args:
+           x, y: 坐标 (km)
+           antenna_height: 天线高度 (m)
+           frequency: 工作频率 (MHz)
+
+       Returns:
+           Position对象
+       """
+       cell = self.get_cell_by_position(x, y)
+       if cell is None:
+           raise ValueError(f"Position ({x}, {y}) is outside terrain coverage")
+
+       terrain_elev = cell.elevation
+       total_height = terrain_elev + antenna_height
+
+       return Position(
+           x=x,
+           y=y,
+           z=total_height,
+           terrain_elevation=terrain_elev,
+           antenna_height=antenna_height,
+           frequency=frequency
+       )
+
+# ==================== 信道模型 ====================
+class ChannelModel:
+   """
+   完整信道损耗模型（ITU-R P.526版本，支持多频率）
+   """
+
+   def __init__(self, terrain: TerrainLoader):
+       self.terrain = terrain
+       print("信道模型初始化完成（ITU-R P.526简化版，支持多频率）")
+
+   # ---------- 基础计算 ----------
+   def _p526_knife_edge_loss(self, nu: float) -> float:
+       """
+       ITU-R P.526-15 刃形衍射损耗计算
+
+       Args:
+           nu: Fresnel-Kirchhoff衍射参数
+
+       Returns:
+           绕射损耗 (dB)
+       """
+       if nu <= FRESNEL_THRESHOLD:
+           return 0.0
+       else:
+           term = np.sqrt((nu - 0.1)**2 + 1) + nu - 0.1
+           if term <= 0:
+               return 0.0
+           return 6.9 + 20 * np.log10(term)
+
+   def _calculate_fspl(self, distance_m: float, freq_mhz: float) -> float:
+       """
+       计算自由空间传播损耗 (FSPL)
+
+       Args:
+           distance_m: 三维距离 (m)
+           freq_mhz: 工作频率 (MHz)
+
+       Returns:
+           自由空间损耗 (dB)
+       """
+       distance_km = distance_m / 1000.0
+       if distance_km < 0.001:
+           distance_km = 0.001
+       return 20 * np.log10(distance_km) + 20 * np.log10(freq_mhz) + 32.45
+
+   # ---------- 新增：链路类型判定 ----------
+   def _get_link_type(self, tx: Position, rx: Position) -> str:
+       """
+       根据高度将链路分为三类:
+       - 'ground_ground' : 双方高度都低于 ALTITUDE_THRESHOLD
+       - 'air_ground'    : 一方 >= ALTITUDE_THRESHOLD, 另一方 < ALTITUDE_THRESHOLD
+       - 'air_air'       : 双方都 >= ALTITUDE_THRESHOLD
+       """
+       tx_air = tx.z >= ALTITUDE_THRESHOLD
+       rx_air = rx.z >= ALTITUDE_THRESHOLD
+
+       if not tx_air and not rx_air:
+           return "ground_ground"
+       elif tx_air and rx_air:
+           return "air_air"
+       else:
+           return "air_ground"
+
+   # ---------- 地形采样 ----------
+   def _sample_path(self, tx: Position, rx: Position) -> List[Tuple[float, float, float]]:
+       """地形剖面采样
+
+       返回: List[(t, x, y)], 其中 t 为 0~1 的归一化路径位置
+       """
+       tx_x_m = tx.x * 1000
+       tx_y_m = tx.y * 1000
+       rx_x_m = rx.x * 1000
+       rx_y_m = rx.y * 1000
+
+       d_2d = np.sqrt((rx_x_m - tx_x_m)**2 + (rx_y_m - tx_y_m)**2)
+       num_samples = int(np.ceil(d_2d / SAMPLE_INTERVAL)) + 1
+
+       samples = []
+       for i in range(num_samples):
+           t = i / (num_samples - 1) if num_samples > 1 else 0.0
+           x = tx.x + (rx.x - tx.x) * t
+           y = tx.y + (rx.y - tx.y) * t
+           samples.append((t, x, y))
+
+       return samples
+
+   # ---------- 地-地链路：障碍物识别 ----------
+   def _identify_obstacles(
+       self,
+       tx: Position,
+       rx: Position,
+       samples: List[Tuple[float, float, float]],
+       wavelength: float
+   ) -> List[Obstacle]:
+       """
+       地-地链路障碍物识别（波长依赖）
+
+       Args:
+           wavelength: 波长 (m)
+       """
+       cell_dict = {}
+       for t, x, y in samples:
+           cell = self.terrain.get_cell_by_position(x, y)
+           if cell is None:
+               continue
+           cell_id = (cell.row, cell.col)
+           if cell_id not in cell_dict:
+               cell_dict[cell_id] = {
+                   't_values': [],
+                   'elevation': cell.elevation
+               }
+           cell_dict[cell_id]['t_values'].append(t)
+
+       obstacles: List[Obstacle] = []
+       for cell_id, cell_data in cell_dict.items():
+           t_values = cell_data['t_values']
+           h_cell = cell_data['elevation']
+
+           t_enter = min(t_values)
+           t_exit = max(t_values)
+
+           h_enter = tx.z + (rx.z - tx.z) * t_enter
+           h_exit = tx.z + (rx.z - tx.z) * t_exit
+           h_los_min = min(h_enter, h_exit)
+
+           t_critical = t_enter if h_enter <= h_exit else t_exit
+
+           # 不高于直视线最低点 → 不是有效障碍
+           if h_cell <= h_los_min:
+               continue
+
+           # 靠近端点的不算（收发端附近平滑处理）
+           if t_critical < BOUNDARY_MARGIN or t_critical > (1 - BOUNDARY_MARGIN):
+               continue
+
+           h_obs = h_cell - h_los_min
+
+           dx = (rx.x - tx.x) * 1000
+           dy = (rx.y - tx.y) * 1000
+           dz = rx.z - tx.z
+           d_total = np.sqrt(dx**2 + dy**2 + dz**2)
+
+           d1 = d_total * t_critical
+           d2 = d_total * (1 - t_critical)
+
+           if d1 < 1 or d2 < 1:
+               continue
+
+           nu = h_obs * np.sqrt(2 * (d1 + d2) / (wavelength * d1 * d2))
+           L = self._p526_knife_edge_loss(nu)
+
+           obstacles.append(Obstacle(
+               cell_id=cell_id,
+               t_critical=t_critical,
+               h_obs=h_obs,
+               nu=nu,
+               L=L
+           ))
+
+       obstacles.sort(key=lambda obs: obs.nu, reverse=True)
+       return obstacles
+
+   def _calculate_overlap_correction(
+       self,
+       obs1: Obstacle,
+       obs2: Obstacle
+   ) -> Tuple[float, str]:
+       """双障碍物耦合计算（地-地链路）"""
+       delta_t = abs(obs1.t_critical - obs2.t_critical)
+
+       if delta_t < OVERLAP_THRESHOLD_1:
+           alpha = 0.5
+           mode = "Strong Coupling"
+       elif delta_t < OVERLAP_THRESHOLD_2:
+           alpha = 0.7
+           mode = "Medium Coupling"
+       else:
+           alpha = 1.0
+           mode = "Independent"
+
+       L_diff = max(obs1.L, obs2.L) + alpha * min(obs1.L, obs2.L)
+       return L_diff, mode
+
+   # ---------- 空-地链路：简化地形绕射 ----------
+   def _calculate_air_ground_diffraction(
+       self,
+       tx: Position,
+       rx: Position,
+       samples: List[Tuple[float, float, float]],
+       wavelength: float,
+       d_total: float
+   ) -> Tuple[float, List[Obstacle], str]:
+       """
+       空-地/地-空链路的简化地形绕射计算：
+
+       - 判定哪一端是地面端
+       - 仅在靠近地面端的一段路径上（AG_NEAR_PORTION）识别障碍物
+       - 计算每个障碍物的 knife-edge 绕射损耗 L
+       - 取原始 L_max = max(L_i)，再做缩放 + 限幅：
+             L_diff_ag = min(AG_DIFF_SCALE * L_max, AG_DIFF_CAP)
+       """
+       # 判定地面端是哪一侧
+       if tx.z < ALTITUDE_THRESHOLD and rx.z >= ALTITUDE_THRESHOLD:
+           ground_is_tx = True
+       elif rx.z < ALTITUDE_THRESHOLD and tx.z >= ALTITUDE_THRESHOLD:
+           ground_is_tx = False
+       else:
+           # 理论上 air_ground 不会进到这里，但防御性处理
+           return 0.0, [], "Air-Ground (Invalid Type For Diffraction)"
+
+       obstacles: List[Obstacle] = []
+
+       for t, x, y in samples:
+           # 只保留靠近地面端的一段路径
+           if ground_is_tx:
+               # 地面端在 tx → t 越小越靠近地面端
+               if t > AG_NEAR_PORTION:
+                   continue
+           else:
+               # 地面端在 rx → t 越大越靠近地面端
+               if t < 1.0 - AG_NEAR_PORTION:
+                   continue
+
+           cell = self.terrain.get_cell_by_position(x, y)
+           if cell is None:
+               continue
+
+           h_cell = cell.elevation
+           # 直视线在该 t 处的高度（线性插值）
+           h_los = tx.z + (rx.z - tx.z) * t
+
+           # 不高于直视线 → 不构成障碍
+           if h_cell <= h_los:
+               continue
+
+           # 靠近端点的不算（平滑处理）
+           if t < BOUNDARY_MARGIN or t > (1 - BOUNDARY_MARGIN):
+               continue
+
+           h_obs = h_cell - h_los
+
+           d1 = d_total * t
+           d2 = d_total * (1.0 - t)
+           if d1 < 1 or d2 < 1:
+               continue
+
+           nu = h_obs * np.sqrt(2.0 * (d1 + d2) / (wavelength * d1 * d2))
+           L = self._p526_knife_edge_loss(nu)
+           if L <= 0.0:
+               continue
+
+           obs = Obstacle(
+               cell_id=(cell.row, cell.col),
+               t_critical=t,
+               h_obs=h_obs,
+               nu=nu,
+               L=L
+           )
+           obstacles.append(obs)
+
+       if not obstacles:
+           return 0.0, [], "Air-Ground (No Terrain Diffraction)"
+
+       # 取原始最大绕射损耗，再做缩放和限幅
+       obstacles.sort(key=lambda o: o.L, reverse=True)
+       L_max_raw = obstacles[0].L
+       L_diff_ag = min(AG_DIFF_SCALE * L_max_raw, AG_DIFF_CAP)
+
+       mode = (
+           f"Air-Ground (Terrain Diffraction, "
+           f"raw_max={L_max_raw:.2f} dB, scaled={AG_DIFF_SCALE}, cap={AG_DIFF_CAP} dB)"
+       )
+
+       # 只返回前两个障碍物，便于调试/记录
+       return L_diff_ag, obstacles[:2], mode
+
+   # ---------- 主计算函数 ----------
+   def calculate_path_loss(
+       self,
+       tx: Position,
+       rx: Position,
+       add_shadow: bool = True
+   ) -> Dict:
+       """
+       计算完整路径损耗（自动提取频率，并对空中链路增加固定损耗）
+
+       Args:
+           tx, rx: 发射端和接收端位置（包含frequency属性，单位MHz）
+           add_shadow: 是否加入阴影衰落
+
+       Returns:
+           包含所有损耗分量的字典
+       """
+       # 频率一致性检查
+       if tx.frequency != rx.frequency:
+           raise ValueError(f"频率不匹配: Tx={tx.frequency} MHz, Rx={rx.frequency} MHz")
+
+       # 使用 MHz 计算 FSPL；Hz / 波长用于绕射
+       freq_mhz = tx.frequency
+       freq_hz = freq_mhz * 1e6
+       wavelength = 3e8 / freq_hz  # 波长 (m)
+
+       # 1. 计算三维距离
+       dx = (rx.x - tx.x) * 1000
+       dy = (rx.y - tx.y) * 1000
+       dz = rx.z - tx.z
+       d_total = np.sqrt(dx**2 + dy**2 + dz**2)
+
+       # 2. 自由空间损耗
+       L_fspl = self._calculate_fspl(d_total, freq_mhz)
+
+       # 3. 判定链路类型
+       link_type = self._get_link_type(tx, rx)
+
+       # 预置额外损耗
+       extra_loss = 0.0
+       if link_type == "air_air":
+           extra_loss = EXTRA_LOSS_AIR_AIR
+       elif link_type == "air_ground":
+           extra_loss = EXTRA_LOSS_AIR_GROUND
+
+       # ---------- 空-空链路：仅 FSPL + 阴影 + 固定损耗 ----------
+       if link_type == "air_air":
+           L_shadow = np.random.normal(0, SIGMA_SHADOW) if add_shadow else 0.0
+           L_total = L_fspl + L_shadow + extra_loss
+
+           overlap_mode = "Air-Air (No Terrain Diffraction)"
+
+           return {
+               'L_total': L_total,
+               'L_fspl': L_fspl,
+               'L_diffraction': 0.0,
+               'L_shadow': L_shadow,
+               'extra_loss': extra_loss,
+               'obstacles': [],
+               'is_air_to_ground': True,   # 只要有空中端就记 True（向后兼容）
+               'link_type': link_type,
+               'overlap_mode': overlap_mode,
+               'samples': [],
+               'distance_m': d_total,
+               'frequency_mhz': freq_mhz,
+               'wavelength': wavelength
+           }
+
+       # ---------- 空-地 / 地-空链路：FSPL + 阴影 + 固定损耗 + 简化绕射 ----------
+       if link_type == "air_ground":
+           samples = self._sample_path(tx, rx)
+           L_diff_ag, obstacles_ag, overlap_mode = self._calculate_air_ground_diffraction(
+               tx, rx, samples, wavelength, d_total
+           )
+
+           L_shadow = np.random.normal(0, SIGMA_SHADOW) if add_shadow else 0.0
+           L_total = L_fspl + L_shadow + extra_loss + L_diff_ag
+
+           return {
+               'L_total': L_total,
+               'L_fspl': L_fspl,
+               'L_diffraction': L_diff_ag,
+               'L_shadow': L_shadow,
+               'extra_loss': extra_loss,          # 固定附加损耗 单位是dB
+               'obstacles': obstacles_ag,
+               'is_air_to_ground': True,
+               'link_type': link_type,
+               'overlap_mode': overlap_mode,
+               'samples': samples,
+               'distance_m': d_total,
+               'frequency_mhz': freq_mhz,
+               'wavelength': wavelength
+           }
+
+       # ---------- 地-地链路：考虑地形绕射 + 阴影 ----------
+       samples = self._sample_path(tx, rx)
+       obstacles = self._identify_obstacles(tx, rx, samples, wavelength)
+
+       L_diffraction = 0.0
+       overlap_mode = "N/A"
+
+       if len(obstacles) == 0:
+           overlap_mode = "No Obstacles"
+       elif len(obstacles) == 1:
+           L_diffraction = obstacles[0].L
+           overlap_mode = "Single Obstacle"
+       else:
+           obs1, obs2 = obstacles[0], obstacles[1]
+           L_diffraction, overlap_mode = self._calculate_overlap_correction(obs1, obs2)
+
+       L_shadow = np.random.normal(0, SIGMA_SHADOW) if add_shadow else 0.0
+
+       L_total = L_fspl + L_diffraction + L_shadow + extra_loss  # extra_loss=0 对地-地
+
+       return {
+           'L_total': L_total,
+           'L_fspl': L_fspl,
+           'L_diffraction': L_diffraction,
+           'L_shadow': L_shadow,
+           'extra_loss': extra_loss,          # 这里为 0
+           'obstacles': obstacles[:2],
+           'is_air_to_ground': False,
+           'link_type': link_type,            # 'ground_ground'
+           'overlap_mode': overlap_mode,
+           'samples': samples,
+           'distance_m': d_total,
+           'frequency_mhz': freq_mhz,
+           'wavelength': wavelength
+       }
+
+
+# ==================== 验证测试 ====================
+def run_verification_tests():
+   """运行完整的验证测试"""
+
+   print("\n" + "="*80)
+   print("信道损耗模型验证测试")
+   print("="*80)
+
+   # 初始化
+   terrain = TerrainLoader("terrain_data.json")
+   model = ChannelModel(terrain)
+
+   print("\n" + "-"*80)
+   print("【测试1】多频率支持 + 空中链路附加损耗验证 + 空地绕射验证")
+   print("-"*80)
+
+   # 构造三个场景：地-地 / 地-空 / 空-空
+   # 地形假设：同一片区域
+   # 1) 地-地
+   g_tx = terrain.create_position(x=2.0, y=3.0, antenna_height=30.0, frequency=600.0)
+   g_rx = terrain.create_position(x=8.0, y=5.0, antenna_height=30.0, frequency=600.0)
+
+   # 2) 地-空（空中高度 2000 m）
+   a_rx = terrain.create_position(x=8.0, y=5.0, antenna_height=2000.0, frequency=600.0)
+
+   # 3) 空-空（两端都是 2000 m）
+   a_tx = terrain.create_position(x=2.0, y=3.0, antenna_height=2000.0, frequency=600.0)
+
+   loss_gg = model.calculate_path_loss(g_tx, g_rx, add_shadow=False)
+   loss_ga = model.calculate_path_loss(g_tx, a_rx, add_shadow=False)
+   loss_aa = model.calculate_path_loss(a_tx, a_rx, add_shadow=False)
+
+   print("\n[地-地链路 Ground-Ground]")
+   print(f"  类型:          {loss_gg['link_type']}")
+   print(f"  FSPL:          {loss_gg['L_fspl']:.2f} dB")
+   print(f"  Diffraction:   {loss_gg['L_diffraction']:.2f} dB")
+   print(f"  Shadow:        {loss_gg['L_shadow']:.2f} dB")
+   print(f"  Extra:         {loss_gg['extra_loss']:.2f} dB")
+   print(f"  Mode:          {loss_gg['overlap_mode']}")
+   print(f"  Total:         {loss_gg['L_total']:.2f} dB")
+
+   print("\n[地-空链路 Ground-Air]")
+   print(f"  类型:          {loss_ga['link_type']}")
+   print(f"  FSPL:          {loss_ga['L_fspl']:.2f} dB")
+   print(f"  Diffraction(AG): {loss_ga['L_diffraction']:.2f} dB")
+   print(f"  Shadow:        {loss_ga['L_shadow']:.2f} dB")
+   print(f"  Extra(+8dB):   {loss_ga['extra_loss']:.2f} dB")
+   print(f"  Mode:          {loss_ga['overlap_mode']}")
+   print(f"  Total:         {loss_ga['L_total']:.2f} dB")
+
+   print("\n[空-空链路 Air-Air]")
+   print(f"  类型:          {loss_aa['link_type']}")
+   print(f"  FSPL:          {loss_aa['L_fspl']:.2f} dB")
+   print(f"  Diffraction:   {loss_aa['L_diffraction']:.2f} dB")
+   print(f"  Shadow:        {loss_aa['L_shadow']:.2f} dB")
+   print(f"  Extra(+18dB):  {loss_aa['extra_loss']:.2f} dB")
+   print(f"  Mode:          {loss_aa['overlap_mode']}")
+   print(f"  Total:         {loss_aa['L_total']:.2f} dB")
+
+   print("\n" + "="*80)
+   print(" 所有验证测试完成")
+   print("="*80)
+
+
+# ==================== 主程序 ====================
+if __name__ == "__main__":
+   run_verification_tests()
