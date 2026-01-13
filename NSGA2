@@ -1,0 +1,1112 @@
+"""
+NSGA-II Multi-Objective Jammer Optimization (pymoo version)  [NO G2]  [OPS SBX/PM]
+
+✅ 优化目标（与NSGA3/SPEA2对齐：优化阶段就乘 Suppr）：
+ 最大化 [Suppr, DeployEff, ResEff, StealthEff]
+ 其中 Eff = raw * Suppr
+
+✅ 日志输出（每代）：
+ 只输出上述 4 个目标的 best/avg，并输出 BestCV 个体的 4 目标值
+ 以及 G1 同频距离约束的诊断（topk worst pairs）
+（不再输出 feasible 相关信息）
+
+✅ CSV（统一绘图：与我给你的 MOEAD 版本一致）：
+A) *_pop_history.csv   每代全种群目标（max语义）+ cv_dist
+B) *_hv_by_gen.csv     每代“历史全局非支配档案”的 HV + archive_size
+C) *_final_archive.csv 最终“历史全局非支配解集合”（画前沿散点图用）
+D) *_solutions.csv     背景点(bg) + pareto(=final_archive)
+
+约束（不等式，<=0 为可行）：
+ G1: 同频干扰机距离 >= 5km（违约量为缺口 km 累加）
+
+"""
+
+import json
+import csv
+import os
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt  # 保留你原来的 import（即使没用也不动）
+
+from pymoo.core.problem import Problem
+from pymoo.optimize import minimize
+from pymoo.core.callback import Callback
+
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.sampling.rnd import IntegerRandomSampling
+from pymoo.core.repair import Repair
+
+from channel_path_loss_model import TerrainLoader, ChannelModel
+
+
+# ==================== 实验标识（用于CSV一致性）====================
+ALGO_NAME = "NSGA2xx"
+RUN_ID = 1
+
+
+# ==================== 日志开关 =====================
+LOG_EVERY_GEN = 1           # 每几代打印一次（1=每代）
+LOG_TOPK = 8                # G1 TopK 明细
+LOG_SHOW_WORST_X = False    # True 会打印 best-CV 个体的 X（很长）
+
+
+# ==================== 距离换算：dist_km = hypot(dx,dy) * XY_TO_KM ====================
+XY_TO_KM = 1.0
+
+
+# ==================== 修复：整数变量 + 连续算子（SBX/PM）====================
+class RoundingRepair(Repair):
+    def _do(self, problem, X, **kwargs):
+        Xr = np.rint(X).astype(int)
+        xl = np.asarray(problem.xl, dtype=int)
+        xu = np.asarray(problem.xu, dtype=int)
+        Xr = np.clip(Xr, xl, xu)
+        return Xr
+
+
+# ==================== 配置参数 ====================
+CHANNELS = [600.0, 601.5, 603.0]
+
+# 通信节点参数
+GAIN_AIR = 2.0
+GAIN_GROUND = 2.5
+JSR_THRESHOLD = 4.77
+
+# 干扰机参数
+J_GAIN_GROUND = 2.0
+J_GAIN_AIR = 1.5
+
+# 功率上限（与 10 档映射一致）
+P_GROUND_MAX = 20.0
+P_AIR_MAX = 10.0
+
+JAMMER_AIR_HEIGHT = 2000.0
+JAMMER_GROUND_HEIGHT = 2.0
+
+# 暴露风险参数（距离单位：km）
+EXPOSURE_DET_THRESHOLD = -80.0
+EXPOSURE_LOUD_THRESHOLD = -70.0
+
+EXPOSURE_PLATFORM_W_G = 1.0
+EXPOSURE_PLATFORM_W_A = 1.5
+
+EXPOSURE_MARGIN_LOUD_DB = EXPOSURE_LOUD_THRESHOLD - EXPOSURE_DET_THRESHOLD
+
+# ✅ 近距离满格阈值 4.0 km
+EXPOSURE_NEAR_DIST_KM = 4.0
+EXPOSURE_FAR_DIST_KM = 15.0
+EXPOSURE_FAR_WEIGHT = 0.2
+
+# 部署成本系数：地面=2 空中=1
+DEPLOY_COST_W_G = 2.0
+DEPLOY_COST_W_A = 1.0
+
+# 资源消耗权重：地面=2 空中=1.2
+RESOURCE_W_G = 2.0
+RESOURCE_W_A = 1.2
+
+# 约束参数（距离单位：km）
+MIN_SAME_CH_JAMMER_DIST = 5.0        # km（只保留 G1）
+
+# 优化参数
+NUM_JAMMERS = 12
+POP_SIZE = 30
+N_GEN = 50
+RNG_SEED = 42
+ADD_SHADOW = False
+
+# 评估过程打印频率
+EVAL_PRINT_INTERVAL = 50
+
+COMM_SCENARIO_FILE = "comm_scenario_natural.json"
+
+# ✅ 输出前缀：指定之前那种格式（只换 algo_name）
+OUT_PREFIX = f"NSGA-3{RUN_ID:04d}{ALGO_NAME}__run{RUN_ID:03d}__seed{RNG_SEED}"
+
+# ========= CSV保存控制（与NSGA3/SPEA2一致）=========
+SAVE_BG_LAST_GENS = 0      # 0=自动（最后20%代，至少10代，最多20代）
+SAVE_BG_MAX_POINTS = 2000  # 背景点最大数量（超了随机采样）
+
+
+# ==================== CSV 工具 =====================
+def _ensure_dir(path: str):
+    d = os.path.dirname(os.path.abspath(path))
+    if d and (not os.path.exists(d)):
+        os.makedirs(d, exist_ok=True)
+
+
+def write_csv_rows(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
+    _ensure_dir(path)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            out = {k: r.get(k, "") for k in fieldnames}
+            w.writerow(out)
+
+
+# ==================== 非支配筛选（最大化语义）====================
+def nondominated_mask_max(F: np.ndarray) -> np.ndarray:
+    """
+    最大化语义：a 支配 b 当且仅当 a>=b(逐维) 且 存在一维 a>b
+    返回 nondominated 的 mask
+    """
+    F = np.asarray(F, dtype=float)
+    n = F.shape[0]
+    if n == 0:
+        return np.zeros((0,), dtype=bool)
+
+    mask = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not mask[i]:
+            continue
+        Fi = F[i]
+
+        idx = np.where(mask)[0]
+        Fj = F[idx]
+
+        # i 是否被支配：存在 k: Fk >= Fi 且 Fk > Fi
+        ge = np.all(Fj >= Fi, axis=1)
+        gt = np.any(Fj > Fi, axis=1)
+        dom_i = ge & gt
+        dom_i[idx == i] = False
+        if np.any(dom_i):
+            mask[i] = False
+            continue
+
+        # i 支配别人：存在 k: Fi >= Fk 且 Fi > Fk
+        le = np.all(Fj <= Fi, axis=1)
+        lt = np.any(Fj < Fi, axis=1)
+        i_dom = le & lt
+        i_dom[idx == i] = False
+        mask[idx[i_dom]] = False
+
+    return mask
+
+
+# ==================== HV（用 pymoo 指标，按最小化输入）====================
+def hypervolume_from_archive_max(F_archive_max: np.ndarray, ref_point_max: Optional[np.ndarray] = None) -> float:
+    """
+    4 个目标都是 [0,1] 的“越大越好”分数（suppr/eff）。
+    HV 通常按“最小化”算，这里做：Fmin = -Fmax
+    ref_point_max 默认取全 0（最差点）；转换到最小化 ref_min=0（更差）
+    """
+    F_archive_max = np.asarray(F_archive_max, dtype=float)
+    if F_archive_max.size == 0:
+        return 0.0
+
+    from pymoo.indicators.hv import HV
+
+    Fmin = -F_archive_max
+    if ref_point_max is None:
+        ref_min = np.zeros(Fmin.shape[1], dtype=float) + 1e-12
+    else:
+        ref_min = -np.asarray(ref_point_max, dtype=float)
+
+    return float(HV(ref_point=ref_min)(Fmin))
+
+
+# ==================== 频道工具（护栏避免静默错判）====================
+def ch_key(ch, max_diff=0.8) -> int:
+    chf = float(ch)
+    diffs = [abs(chf - c) for c in CHANNELS]
+    k = int(np.argmin(diffs))
+    if diffs[k] > max_diff:
+        raise ValueError(
+            f"Channel {ch} too far from supported CHANNELS={CHANNELS} (min diff={diffs[k]:.6f})"
+        )
+    return k
+
+
+def ch_canon(ch) -> float:
+    return float(CHANNELS[ch_key(ch)])
+
+
+# ==================== 单位推断（更鲁棒 + fallback）====================
+def infer_xy_to_km(nodes_comm, terrain, model, n_pairs=40, min_xy_dist=1e-6):
+    nodes = list(nodes_comm)
+    if len(nodes) < 2:
+        return 1.0
+
+    ratios = []
+    rng = np.random.RandomState(0)
+
+    for _ in range(n_pairs):
+        a = nodes[rng.randint(len(nodes))]
+        b = nodes[rng.randint(len(nodes))]
+        if str(a.get("id")) == str(b.get("id")):
+            continue
+
+        f0 = ch_canon(a["ch"])
+        pa = terrain.create_position(float(a["x"]), float(a["y"]), float(a.get("z", 0.0)), frequency=f0)
+        pb = terrain.create_position(float(b["x"]), float(b["y"]), float(b.get("z", 0.0)), frequency=f0)
+        res = model.calculate_path_loss(pa, pb, add_shadow=False)
+        d_km_model = float(res["distance_m"]) / 1000.0
+
+        dx = float(a["x"]) - float(b["x"])
+        dy = float(a["y"]) - float(b["y"])
+        d_xy = float(np.hypot(dx, dy))
+        if (not np.isfinite(d_xy)) or d_xy <= min_xy_dist:
+            continue
+        if not np.isfinite(d_km_model) or d_km_model <= 0:
+            continue
+
+        ratios.append(d_km_model / d_xy)
+
+    if not ratios:
+        return 1.0
+
+    r = float(np.median(ratios))
+    if 0.0005 < r < 0.002:
+        return 0.001
+    if 0.5 < r < 2.0:
+        return 1.0
+    return r
+
+
+# ==================== 工具函数（核心计算）====================
+def calc_rx_power_comm(model, terrain, tx_node, rx_node):
+    f0 = ch_canon(tx_node['ch'])
+    tx_pos = terrain.create_position(float(tx_node['x']), float(tx_node['y']),
+                                     float(tx_node.get('z', 0.0)), frequency=f0)
+    rx_pos = terrain.create_position(float(rx_node['x']), float(rx_node['y']),
+                                     float(rx_node.get('z', 0.0)), frequency=f0)
+    result = model.calculate_path_loss(tx_pos, rx_pos, add_shadow=ADD_SHADOW)
+    L_total = float(result['L_total'])
+    dist_km = float(result['distance_m']) / 1000.0
+    tx_dbm = 10 * np.log10(float(tx_node['power']) * 1000.0)
+    gain_tx = GAIN_AIR if tx_node['type'] == 'air' else GAIN_GROUND
+    gain_rx = GAIN_AIR if rx_node['type'] == 'air' else GAIN_GROUND
+    rx_dbm = tx_dbm + gain_tx + gain_rx - L_total
+    return float(rx_dbm), float(dist_km)
+
+
+def calc_rx_power_jammer(model, terrain, jammer, rx_node):
+    if ch_key(jammer['ch']) != ch_key(rx_node['ch']):
+        return -np.inf
+
+    f0 = ch_canon(jammer['ch'])
+    jam_pos = terrain.create_position(float(jammer['x']), float(jammer['y']),
+                                      float(jammer.get('z', 0.0)), frequency=f0)
+    rx_pos = terrain.create_position(float(rx_node['x']), float(rx_node['y']),
+                                     float(rx_node.get('z', 0.0)), frequency=f0)
+
+    result = model.calculate_path_loss(jam_pos, rx_pos, add_shadow=ADD_SHADOW)
+    L_total = float(result['L_total'])
+    tx_dbm = 10 * np.log10(float(jammer['power']) * 1000.0)
+    gain_tx = J_GAIN_AIR if jammer['type'] == 'air' else J_GAIN_GROUND
+    gain_rx = GAIN_AIR if rx_node['type'] == 'air' else GAIN_GROUND
+    rx_dbm = tx_dbm + gain_tx + gain_rx - L_total
+    return float(rx_dbm)
+
+
+def load_comm_scenario(path=COMM_SCENARIO_FILE):
+    with open(path, "r", encoding="utf-8") as f:
+        scen = json.load(f)
+
+    nodes_comm = scen["nodes_comm"]
+    occupied = {tuple(c) for c in scen["occupied"]}
+    forbidden_all = {tuple(c) for c in scen["forbidden_all"]}
+    jammer_cands = [(c["x"], c["y"], c["z"], c["row"], c["col"]) for c in scen["jammer_cands"]]
+    return nodes_comm, occupied, forbidden_all, jammer_cands
+
+
+def build_dominant_links(nodes_comm, terrain, model):
+    nodes_by_key = {}
+    for n in nodes_comm:
+        nodes_by_key.setdefault(ch_key(n['ch']), []).append(n)
+
+    links = []
+    for k in range(len(CHANNELS)):
+        ch_nodes = nodes_by_key.get(k, [])
+        if len(ch_nodes) < 2:
+            continue
+
+        for rx in ch_nodes:
+            best_tx, best_S, best_dist = None, -np.inf, 0.0
+            for tx in ch_nodes:
+                if str(tx['id']) == str(rx['id']):
+                    continue
+                S_dbm, dist_km = calc_rx_power_comm(model, terrain, tx, rx)
+                if S_dbm > best_S:
+                    best_S, best_tx, best_dist = S_dbm, tx, dist_km
+
+            if best_tx is not None:
+                links.append({
+                    'tx': best_tx,
+                    'rx': rx,
+                    'ch': float(CHANNELS[k]),
+                    'ch_key': int(k),
+                    'S_dbm': float(best_S),
+                    'dist_km': float(best_dist)
+                })
+    return links
+
+
+def evaluate_dominant_links_with_jammers(links_dominant, jammers, terrain, model):
+    results = []
+    for link in links_dominant:
+        tx, rx = link['tx'], link['rx']
+        S_dbm, dist_km = link['S_dbm'], link['dist_km']
+        lk = int(link.get('ch_key', ch_key(link['ch'])))
+
+        same_ch_jammers = [j for j in jammers if ch_key(j['ch']) == lk]
+
+        if not same_ch_jammers:
+            J_dbm, JSR_db = -np.inf, -np.inf
+        else:
+            J_mW_total = 0.0
+            for jam in same_ch_jammers:
+                j_rx_dbm = calc_rx_power_jammer(model, terrain, jam, rx)
+                if np.isfinite(j_rx_dbm):
+                    J_mW_total += 10 ** (j_rx_dbm / 10.0)
+
+            if J_mW_total <= 0.0:
+                J_dbm, JSR_db = -np.inf, -np.inf
+            else:
+                J_dbm = 10 * np.log10(J_mW_total)
+                JSR_db = J_dbm - S_dbm
+
+        results.append({
+            'tx_id': tx['id'],
+            'rx_id': rx['id'],
+            'ch': float(CHANNELS[lk]),
+            'dist_km': float(dist_km),
+            'S_dbm': float(S_dbm),
+            'J_dbm': float(J_dbm) if np.isfinite(J_dbm) else -np.inf,
+            'JSR_db': float(JSR_db) if np.isfinite(JSR_db) else -np.inf
+        })
+    return results
+
+
+def compute_suppression_rate(link_results, jsr_threshold=JSR_THRESHOLD):
+    total = len(link_results)
+    if total == 0:
+        return 0.0
+    count_suppr = sum(1 for r in link_results if np.isfinite(r['JSR_db']) and r['JSR_db'] >= jsr_threshold)
+    return count_suppr / total
+
+
+def compute_deploy_cost_score(jammers):
+    N_g = sum(1 for j in jammers if j['type'] == 'ground')
+    N_a = sum(1 for j in jammers if j['type'] == 'air')
+    C_raw = DEPLOY_COST_W_G * N_g + DEPLOY_COST_W_A * N_a
+    C_max = max(DEPLOY_COST_W_G, DEPLOY_COST_W_A) * NUM_JAMMERS
+    c_norm = 0.0 if C_max <= 0 else float(np.clip(C_raw / C_max, 0.0, 1.0))
+    score = 1.0 - c_norm
+    return float(score), float(c_norm), float(C_raw)
+
+
+def compute_resource_score(jammers):
+    if not jammers:
+        return 1.0, 0.0
+
+    terms = []
+    for jam in jammers:
+        if jam['type'] == 'ground':
+            p_norm = float(jam['power']) / P_GROUND_MAX
+            w = RESOURCE_W_G
+        else:
+            p_norm = float(jam['power']) / P_AIR_MAX
+            w = RESOURCE_W_A
+        p_norm = float(np.clip(p_norm, 0.0, 1.0))
+        terms.append(w * p_norm)
+
+    avg_term = float(np.mean(terms)) if terms else 0.0
+    worst_w = max(RESOURCE_W_G, RESOURCE_W_A)
+    c_res = float(np.clip(avg_term / worst_w, 0.0, 1.0))
+    score = 1.0 - c_res
+    return float(score), float(c_res)
+
+
+def compute_exposure_score(nodes_comm, jammers, terrain, model):
+    global XY_TO_KM
+
+    if not jammers:
+        return 1.0, 0.0
+
+    nodes_by_key = {}
+    for n in nodes_comm:
+        nodes_by_key.setdefault(ch_key(n["ch"]), []).append(n)
+
+    R_ks = []
+    for jam in jammers:
+        over_loud = False
+        visible_contribs = []
+
+        same_nodes = nodes_by_key.get(ch_key(jam["ch"]), [])
+
+        for node in same_nodes:
+            rx_dbm = calc_rx_power_jammer(model, terrain, jam, node)
+
+            dx = float(jam["x"]) - float(node["x"])
+            dy = float(jam["y"]) - float(node["y"])
+            dist_km = float(np.hypot(dx, dy)) * float(XY_TO_KM)
+
+            if not np.isfinite(rx_dbm):
+                continue
+
+            if rx_dbm > EXPOSURE_LOUD_THRESHOLD:
+                over_loud = True
+                break
+
+            if rx_dbm >= EXPOSURE_DET_THRESHOLD:
+                margin_db = rx_dbm - EXPOSURE_DET_THRESHOLD
+                denom = (EXPOSURE_MARGIN_LOUD_DB if EXPOSURE_MARGIN_LOUD_DB != 0 else 1.0)
+                loud_norm = float(np.clip(margin_db / denom, 0.0, 1.0))
+
+                if dist_km <= EXPOSURE_NEAR_DIST_KM:
+                    w_d = 1.0
+                elif dist_km >= EXPOSURE_FAR_DIST_KM:
+                    w_d = EXPOSURE_FAR_WEIGHT
+                else:
+                    ratio = ((dist_km - EXPOSURE_NEAR_DIST_KM) /
+                             (EXPOSURE_FAR_DIST_KM - EXPOSURE_NEAR_DIST_KM))
+                    w_d = 1.0 - (1.0 - EXPOSURE_FAR_WEIGHT) * ratio
+
+                visible_contribs.append(loud_norm * w_d)
+
+        if over_loud:
+            R_node = 1.0
+        else:
+            R_node = float(np.mean(visible_contribs)) if visible_contribs else 0.0
+
+        beta = EXPOSURE_PLATFORM_W_G if jam['type'] == 'ground' else EXPOSURE_PLATFORM_W_A
+        R_ks.append(float(np.clip(R_node * beta, 0.0, 1.0)))
+
+    exposure_raw = float(np.mean(R_ks)) if R_ks else 0.0
+    score = 1.0 - exposure_raw
+    return float(score), float(exposure_raw)
+
+
+def constraint_violation_same_ch_dist(jammers, min_dist_km=MIN_SAME_CH_JAMMER_DIST):
+    global XY_TO_KM
+
+    v = 0.0
+    n = len(jammers)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if ch_key(jammers[i]['ch']) == ch_key(jammers[j]['ch']):
+                dx = float(jammers[i]["x"]) - float(jammers[j]["x"])
+                dy = float(jammers[i]["y"]) - float(jammers[j]["y"])
+                dist_km = float(np.hypot(dx, dy)) * float(XY_TO_KM)
+                if dist_km < min_dist_km:
+                    v += (min_dist_km - dist_km)
+    return float(v)
+
+
+# ==================== 诊断工具 =====================
+def dist_xy_km(x1, y1, x2, y2):
+    return float(np.hypot(float(x1) - float(x2), float(y1) - float(y2))) * float(XY_TO_KM)
+
+
+def summarize_solution_basic(jammers):
+    n = len(jammers)
+    n_valid = sum(1 for j in jammers if j.get("valid_place", True))
+    n_invalid = n - n_valid
+    reasons = {}
+    for j in jammers:
+        if j.get("valid_place", True):
+            continue
+        r = j.get("invalid_reason", "unknown")
+        reasons[r] = reasons.get(r, 0) + 1
+    return n_valid, n_invalid, reasons
+
+
+def diagnose_g1_same_ch_distance(jammers, min_dist_km=MIN_SAME_CH_JAMMER_DIST, topk=8):
+    worst = []
+    per_ch = {}
+    total_pairs = 0
+    viol_pairs = 0
+
+    for i in range(len(jammers)):
+        for j in range(i + 1, len(jammers)):
+            try:
+                ki = ch_key(jammers[i]["ch"])
+                kj = ch_key(jammers[j]["ch"])
+            except Exception as e:
+                worst.append((1e9, -1.0, "CH_ERR", jammers[i].get("id"), jammers[j].get("id"), str(e), None))
+                continue
+
+            if ki != kj:
+                continue
+
+            total_pairs += 1
+            ch = float(CHANNELS[ki])
+            d = dist_xy_km(jammers[i]["x"], jammers[i]["y"], jammers[j]["x"], jammers[j]["y"])
+
+            st = per_ch.setdefault(ch, {"pairs": 0, "viol": 0, "min_dist": float("inf")})
+            st["pairs"] += 1
+            st["min_dist"] = min(st["min_dist"], d)
+
+            if d < min_dist_km:
+                viol_pairs += 1
+                st["viol"] += 1
+                deficit = float(min_dist_km - d)
+                worst.append((
+                    deficit, d, ch,
+                    jammers[i]["id"], jammers[j]["id"],
+                    (float(jammers[i]["x"]), float(jammers[i]["y"])),
+                    (float(jammers[j]["x"]), float(jammers[j]["y"]))
+                ))
+
+    worst.sort(key=lambda x: x[0], reverse=True)
+    return {
+        "total_pairs": int(total_pairs),
+        "viol_pairs": int(viol_pairs),
+        "worst": worst[:topk],
+        "per_ch": per_ch
+    }
+
+
+# ==================== pymoo 问题定义（与NSGA3/SPEA2对齐：整数+repair，目标=Eff）====================
+class JammerOptimizationProblem(Problem):
+    def __init__(self, nodes_comm, jammer_cands, occupied, forbidden_all,
+                 dominant_links, terrain, model, rng):
+        self.nodes_comm = nodes_comm
+        self.jammer_cands = jammer_cands
+        self.occupied = occupied
+        self.forbidden_all = forbidden_all
+        self.dominant_links = dominant_links
+        self.terrain = terrain
+        self.model = model
+        self.rng = rng
+
+        n_var = NUM_JAMMERS * 4
+
+        xl = np.zeros(n_var, dtype=int)
+        xu = np.zeros(n_var, dtype=int)
+
+        for i in range(NUM_JAMMERS):
+            xl[i*4]   = 0
+            xu[i*4]   = len(jammer_cands) - 1
+            xl[i*4+1] = 0
+            xu[i*4+1] = 1
+            xl[i*4+2] = 0
+            xu[i*4+2] = len(CHANNELS) - 1
+            xl[i*4+3] = 0
+            xu[i*4+3] = 9
+
+        super().__init__(
+            n_var=n_var,
+            n_obj=4,
+            n_ieq_constr=1,   #   G1
+            xl=xl,
+            xu=xu,
+            vtype=int
+        )
+        self.eval_count = 0
+
+    def _build_one_jammer(self, k, pos_idx, type_idx, ch_idx, pow_idx):
+        x_pos, y_pos, z_terrain, row, col = self.jammer_cands[pos_idx]
+        cell_id = (row, col)
+
+        jam_type = 'air' if int(type_idx) == 1 else 'ground'
+        ch = float(CHANNELS[int(ch_idx)])
+
+        level = int(pow_idx) + 1
+        if jam_type == 'air':
+            z = JAMMER_AIR_HEIGHT
+            power = float(level) * 1.0
+            power = min(power, P_AIR_MAX)
+        else:
+            z = JAMMER_GROUND_HEIGHT
+            power = float(level) * 2.0
+            power = min(power, P_GROUND_MAX)
+
+        return {
+            'id': f'J{k+1}',
+            'type': jam_type,
+            'x': float(x_pos),
+            'y': float(y_pos),
+            'z': float(z),
+            'ch': float(ch),
+            'power': float(power),
+            'row': int(row),
+            'col': int(col),
+            'level': int(level),
+            'cell_id': cell_id,
+            'valid_place': True,
+            'invalid_reason': ""
+        }
+
+    def _decode_solution(self, x):
+        jammers = []
+        used_cells = set()
+
+        x = np.rint(np.asarray(x)).astype(int)
+
+        for k in range(NUM_JAMMERS):
+            pos_idx = int(x[k*4])
+            type_idx = int(x[k*4+1])
+            ch_idx = int(x[k*4+2])
+            pow_idx = int(x[k*4+3])
+
+            jam = self._build_one_jammer(k, pos_idx, type_idx, ch_idx, pow_idx)
+            cell_id = jam['cell_id']
+
+            if cell_id in self.occupied:
+                jam['valid_place'] = False
+                jam['invalid_reason'] = "occupied"
+            elif cell_id in self.forbidden_all:
+                jam['valid_place'] = False
+                jam['invalid_reason'] = "forbidden"
+            elif cell_id in used_cells:
+                jam['valid_place'] = False
+                jam['invalid_reason'] = "duplicate"
+            else:
+                used_cells.add(cell_id)
+
+            jammers.append(jam)
+
+        return jammers
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        n_samples = X.shape[0]
+        F = np.zeros((n_samples, 4))
+        G = np.zeros((n_samples, 1))
+
+        for k in range(n_samples):
+            self.eval_count += 1
+            if self.eval_count % EVAL_PRINT_INTERVAL == 0:
+                print(f"  [Progress] Evaluated {self.eval_count} solutions...")
+
+            jammers_raw = self._decode_solution(X[k, :])
+
+            # G1：同频距离（对 raw 计算）
+            cv_dist = constraint_violation_same_ch_dist(jammers_raw, MIN_SAME_CH_JAMMER_DIST)
+            G[k, 0] = float(cv_dist)
+
+            # Suppr：只用 valid_place=True 的 jammer（不再做 RX 红线过滤）
+            jammers_eff = [j for j in jammers_raw if j.get('valid_place', True)]
+            link_results = evaluate_dominant_links_with_jammers(
+                self.dominant_links, jammers_eff, self.terrain, self.model
+            )
+            suppr = float(compute_suppression_rate(link_results))
+
+            # raw 指标（内部算，用于 Eff）
+            deploy_raw, _, _ = compute_deploy_cost_score(jammers_raw)
+            res_raw, _ = compute_resource_score(jammers_raw)
+            stealth_raw, _ = compute_exposure_score(self.nodes_comm, jammers_raw, self.terrain, self.model)
+
+            #  Eff = raw * Suppr（与NSGA3/SPEA2对齐）
+            deploy_eff = float(deploy_raw * suppr)
+            res_eff = float(res_raw * suppr)
+            stealth_eff = float(stealth_raw * suppr)
+
+            # pymoo 默认最小化 => 取负
+            F[k, 0] = -suppr
+            F[k, 1] = -deploy_eff
+            F[k, 2] = -res_eff
+            F[k, 3] = -stealth_eff
+
+        out["F"] = F
+        out["G"] = G
+
+
+# ==================== 回调：打印 + 缓存CSV数据（并维护“历史全局非支配档案”）====================
+class DetailedCallback(Callback):
+    @staticmethod
+    def cv_sum(G):
+        return np.sum(np.maximum(0.0, G), axis=1)
+
+    def __init__(self, problem: JammerOptimizationProblem):
+        super().__init__()
+        self.problem = problem
+
+        # 原有 metrics（保留，兼容你之前的格式）
+        self.metrics_rows: List[Dict[str, Any]] = []
+        self.feas_cache: List[Dict[str, Any]] = []
+
+        # 新增：全种群历史（统一绘图）
+        self.pop_rows: List[Dict[str, Any]] = []
+
+        # 新增：external archive（历史全局非支配集合，仅纳入可行点）
+        self.arc_F: np.ndarray = np.zeros((0, 4), dtype=float)   # 最大化语义目标
+        self.arc_cv: np.ndarray = np.zeros((0,), dtype=float)    # 对应 cv_dist
+
+        # 新增：每代 HV(archive)
+        self.hv_rows: List[Dict[str, Any]] = []
+
+    def _update_archive(self, F_max: np.ndarray, cv_dist: np.ndarray):
+        feas = (cv_dist <= 0.0)
+        if not np.any(feas):
+            return
+
+        F_in = F_max[feas]
+        cv_in = cv_dist[feas]
+
+        if self.arc_F.size == 0:
+            allF = F_in
+            allcv = cv_in
+        else:
+            allF = np.vstack([self.arc_F, F_in])
+            allcv = np.concatenate([self.arc_cv, cv_in], axis=0)
+
+        nd = nondominated_mask_max(allF)
+        self.arc_F = allF[nd]
+        self.arc_cv = allcv[nd]
+
+    def notify(self, algorithm):
+        gen = int(algorithm.n_gen)
+
+        pop = algorithm.pop
+        F = -pop.get("F")   # 最大化语义（eff目标）
+        G = pop.get("G")
+        X = pop.get("X")
+
+        pop_n = int(len(pop))
+        cv_dist = G[:, 0].astype(float)
+
+        # 1) 统一绘图：写全种群 history
+        for i in range(pop_n):
+            suppr, deployEff, resEff, stealthEff = map(float, F[i])
+            self.pop_rows.append({
+                "algo_name": ALGO_NAME,
+                "run_id": RUN_ID,
+                "gen": gen,
+                "ind": i,
+                "suppr": suppr,
+                "deployEff": deployEff,
+                "resEff": resEff,
+                "stealthEff": stealthEff,
+                "cv_dist": float(cv_dist[i]),
+            })
+
+        # 2) 维护本代可行缓存（用于 bg）
+        feasible_mask = np.all(G <= 0.0, axis=1)
+        n_feas = int(np.sum(feasible_mask))
+        if n_feas > 0:
+            self.feas_cache.append({
+                "gen": gen,
+                "X": np.rint(X[feasible_mask]).astype(int).copy(),
+                "F": F[feasible_mask].copy(),
+                "G": G[feasible_mask].copy()
+            })
+        else:
+            self.feas_cache.append({
+                "gen": gen,
+                "X": np.zeros((0, X.shape[1]), dtype=int),
+                "F": np.zeros((0, 4), dtype=float),
+                "G": np.zeros((0, 1), dtype=float)
+            })
+
+        # 3) 原有 metrics.csv 行（保留字段，不改你旧格式）
+        feasible_ratio = (n_feas / pop_n) if pop_n > 0 else 0.0
+        row = {
+            "algo_name": ALGO_NAME,
+            "run_id": RUN_ID,
+            "gen": gen,
+            "feasible_ratio": float(feasible_ratio),
+            "best_feas_suppr": np.nan,
+            "best_feas_deployEff": np.nan,
+            "best_feas_resEff": np.nan,
+            "best_feas_stealthEff": np.nan,
+            "avg_feas_suppr": np.nan
+        }
+        if n_feas > 0:
+            Ff = F[feasible_mask]
+            idx_local = int(np.argmax(Ff[:, 0]))  # best feasible by suppr
+            best = Ff[idx_local]
+            row["best_feas_suppr"] = float(best[0])
+            row["best_feas_deployEff"] = float(best[1])
+            row["best_feas_resEff"] = float(best[2])
+            row["best_feas_stealthEff"] = float(best[3])
+            row["avg_feas_suppr"] = float(np.mean(Ff[:, 0]))
+        self.metrics_rows.append(row)
+
+        # 4) 更新历史全局非支配档案 + 计算 HV
+        self._update_archive(F, cv_dist)
+        hv = hypervolume_from_archive_max(self.arc_F, ref_point_max=np.zeros(4, dtype=float))
+        self.hv_rows.append({
+            "algo_name": ALGO_NAME,
+            "run_id": RUN_ID,
+            "gen": gen,
+            "hv": float(hv),
+            "archive_size": int(self.arc_F.shape[0]),
+        })
+
+        # 5) 日志打印（不再输出 feasible）
+        if (gen % LOG_EVERY_GEN) != 0:
+            return
+
+        bests = np.max(F, axis=0)
+        avgs  = np.mean(F, axis=0)
+
+        g1_viol = int(np.sum(G[:, 0] > 0))
+
+        cvsum = self.cv_sum(G)
+        best_cv_idx = int(np.argmin(cvsum))
+        min_cv_sum = float(cvsum[best_cv_idx])
+        min_cv_g1 = float(max(0.0, G[best_cv_idx, 0]))
+
+        print(
+            f"\n[Gen {gen:03d}/{N_GEN}] "
+            f"ViolCount(G1)={g1_viol}/{len(pop)} | "
+            f"minCV_sum={min_cv_sum:.3f} (G1={min_cv_g1:.3f}) | "
+            f"ArchiveSize={int(self.arc_F.shape[0])} | HV={hv:.6f}"
+        )
+        print(
+            f"  [OBJ(all)] "
+            f"Suppr best/avg={bests[0]:.3f}/{avgs[0]:.3f} | "
+            f"DeployEff best/avg={bests[1]:.3f}/{avgs[1]:.3f} | "
+            f"ResEff best/avg={bests[2]:.3f}/{avgs[2]:.3f} | "
+            f"StealthEff best/avg={bests[3]:.3f}/{avgs[3]:.3f}"
+        )
+
+        X_bestcv = np.rint(X[best_cv_idx]).astype(int)
+        if LOG_SHOW_WORST_X:
+            print(f"  [BestCV] X = {X_bestcv}")
+
+        try:
+            jammers_raw = self.problem._decode_solution(X_bestcv)
+        except Exception as e:
+            print(f"  [BestCV][FATAL] decode failed: {e}")
+            return
+
+        b = F[best_cv_idx]
+        print(
+            f"  [BestCV][OBJ] "
+            f"Suppr={b[0]:.3f} | DeployEff={b[1]:.3f} | ResEff={b[2]:.3f} | StealthEff={b[3]:.3f}"
+        )
+
+        n_valid, n_invalid, reasons = summarize_solution_basic(jammers_raw)
+        print(f"  [BestCV] Jammers raw: total={len(jammers_raw)}, valid_place={n_valid}, invalid_place={n_invalid}, reasons={reasons}")
+
+        try:
+            g1 = diagnose_g1_same_ch_distance(jammers_raw, MIN_SAME_CH_JAMMER_DIST, topk=LOG_TOPK)
+            print(f"  [BestCV][G1] same-ch pairs={g1['total_pairs']}, viol_pairs={g1['viol_pairs']}")
+            if g1["per_ch"]:
+                for ch, st in sorted(g1["per_ch"].items(), key=lambda kv: kv[0]):
+                    md = st["min_dist"] if np.isfinite(st["min_dist"]) else None
+                    print(f"    - ch={ch:.1f}: pairs={st['pairs']}, viol={st['viol']}, min_dist_km={md:.3f}")
+            if g1["worst"]:
+                print(f"  [BestCV][G1] worst deficits top{len(g1['worst'])}:")
+                for item in g1["worst"]:
+                    if item[2] == "CH_ERR":
+                        print(f"    * CH_ERR pair ({item[3]},{item[4]}): {item[5]}")
+                        continue
+                    deficit, dist, ch, ji, jj, p1, p2 = item
+                    print(f"    * deficit={deficit:.3f}km, dist={dist:.3f}km, ch={ch:.1f}, pair=({ji},{jj}), p1={p1}, p2={p2}")
+        except Exception as e:
+            print(f"  [BestCV][G1][WARN] diagnose failed: {e}")
+
+
+# ==================== solutions.csv 辅助（与NSGA3/SPEA2一致）====================
+def channel_hist_from_X(x: np.ndarray) -> Dict[str, int]:
+    x = np.rint(np.asarray(x)).astype(int)
+    ch_idx = x[2::4].astype(int)
+    return {
+        "ch600_count": int(np.sum(ch_idx == 0)),
+        "ch6015_count": int(np.sum(ch_idx == 1)),
+        "ch603_count": int(np.sum(ch_idx == 2)),
+    }
+
+
+def num_valid_place_from_X(problem: JammerOptimizationProblem, x: np.ndarray) -> int:
+    jammers_raw = problem._decode_solution(np.rint(np.asarray(x)).astype(int))
+    return int(sum(1 for j in jammers_raw if j.get("valid_place", True)))
+
+
+# ==================== 主程序 ====================
+def main():
+    global XY_TO_KM
+
+    print("=" * 70)
+    print("NSGA-II Jammer Optimization (pymoo + Detailed Diagnostics)  [NO G2]  [OPS SBX/PM]  [EFF OBJECTIVES]")
+    print("=" * 70)
+
+    print(f"\n[Config] algo_name:          {ALGO_NAME}")
+    print(f"[Config] run_id:            {RUN_ID}")
+    print(f"[Config] Random seed:        {RNG_SEED}")
+    print(f"[Config] Generations:       {N_GEN}")
+    print(f"[Config] NUM_JAMMERS:        {NUM_JAMMERS}")
+    print(f"[Config] POP_SIZE:          {POP_SIZE}")
+    print(f"[Config] add_shadow:        {ADD_SHADOW}")
+    print(f"[Config] Min same-ch dist:  {MIN_SAME_CH_JAMMER_DIST} km")
+    print(f"[Config] Exposure near(full): {EXPOSURE_NEAR_DIST_KM} km  (<= near => distance weight=1.0)")
+    print(f"[Config] Output prefix:     {OUT_PREFIX}")
+
+    rng = np.random.RandomState(RNG_SEED)
+
+    print("\n[Step 1] Loading terrain & channel model...")
+    terrain = TerrainLoader("terrain_data.json")
+    model = ChannelModel(terrain)
+    print(f"  ✅ Terrain: {len(terrain.cells)} hex cells")
+
+    print("\n[Step 2] Loading communication scenario...")
+    nodes_comm, occupied, forbidden_all, jammer_cands = load_comm_scenario()
+    print(f"  Nodes: {len(nodes_comm)}")
+    print(f"   Jammer candidates: {len(jammer_cands)}")
+
+    XY_TO_KM = float(infer_xy_to_km(nodes_comm, terrain, model, n_pairs=60, min_xy_dist=1e-6))
+    print(f"[UnitCheck] XY_TO_KM inferred = {XY_TO_KM}  (dist_km = hypot(dx,dy)*XY_TO_KM)")
+    if not (0.0001 < XY_TO_KM < 10.0):
+        print(f"[UnitCheck][WARN] XY_TO_KM={XY_TO_KM} looks suspicious, fallback to 1.0")
+        XY_TO_KM = 1.0
+
+    print("\n[Step 3] Building dominant links...")
+    dominant_links = build_dominant_links(nodes_comm, terrain, model)
+    print(f"   Dominant links: {len(dominant_links)}")
+
+    print("\n[Step 4] Defining optimization problem...")
+    problem = JammerOptimizationProblem(
+        nodes_comm, jammer_cands, occupied, forbidden_all,
+        dominant_links, terrain, model, rng
+    )
+    print(f"   Decision variables: {problem.n_var}")
+    print(f"   Objectives: {problem.n_obj} (Suppr + 3x Eff)")
+    print(f"   Constraints: {problem.n_ieq_constr} (G1 distance only)")
+
+    print("\n[Step 5] Configuring NSGA-II (OPS SBX/PM + RoundingRepair)...")
+    algorithm = NSGA2(
+        pop_size=POP_SIZE,
+        sampling=IntegerRandomSampling(),
+        crossover=SBX(prob=0.9, eta=15, vtype=float),
+        mutation=PM(eta=20, vtype=float),
+        repair=RoundingRepair(),
+        eliminate_duplicates=False
+    )
+
+    print("\n[Step 6] Running NSGA-II optimization...\n")
+    cb = DetailedCallback(problem)
+    _ = minimize(
+        problem,
+        algorithm,
+        ('n_gen', N_GEN),
+        seed=RNG_SEED,
+        callback=cb,
+        verbose=False
+    )
+
+    # ==================== 写 metrics.csv（保留旧格式）====================
+    print("\n[Step 7] Saving per-generation metrics CSV...")
+    metrics_path = f"{OUT_PREFIX}_metrics.csv"
+    metrics_fields = [
+        "algo_name", "run_id", "gen",
+        "feasible_ratio",
+        "best_feas_suppr", "best_feas_stealthEff", "best_feas_resEff", "best_feas_deployEff",
+        "avg_feas_suppr"
+    ]
+    write_csv_rows(metrics_path, cb.metrics_rows, metrics_fields)
+    print(f"   Saved: {metrics_path}")
+
+    # ==================== 新增：统一绘图 CSV（和你 MOEAD 那套一致）====================
+    print("\n[Step 8] Saving plotting CSVs (pop_history + hv_by_gen + final_archive + solutions)...")
+
+    pop_history_path = f"{OUT_PREFIX}_pop_history.csv"
+    pop_fields = [
+        "algo_name", "run_id", "gen", "ind",
+        "suppr", "deployEff", "resEff", "stealthEff",
+        "cv_dist"
+    ]
+    write_csv_rows(pop_history_path, cb.pop_rows, pop_fields)
+    print(f"   Saved: {pop_history_path}")
+
+    hv_path = f"{OUT_PREFIX}_hv_by_gen.csv"
+    hv_fields = ["algo_name", "run_id", "gen", "hv", "archive_size"]
+    write_csv_rows(hv_path, cb.hv_rows, hv_fields)
+    print(f"   Saved: {hv_path}")
+
+    final_archive_path = f"{OUT_PREFIX}_final_archive.csv"
+    final_arc_rows: List[Dict[str, Any]] = []
+    for i in range(cb.arc_F.shape[0]):
+        suppr, deployEff, resEff, stealthEff = map(float, cb.arc_F[i])
+        final_arc_rows.append({
+            "algo_name": ALGO_NAME,
+            "run_id": RUN_ID,
+            "suppr": suppr,
+            "deployEff": deployEff,
+            "resEff": resEff,
+            "stealthEff": stealthEff,
+            "cv_dist": float(cb.arc_cv[i]),
+        })
+    final_arc_fields = ["algo_name", "run_id", "suppr", "deployEff", "resEff", "stealthEff", "cv_dist"]
+    write_csv_rows(final_archive_path, final_arc_rows, final_arc_fields)
+    print(f"   Saved: {final_archive_path}  (Global ND Archive)")
+
+    # ==================== solutions.csv：bg(最后若干代可行解) + pareto(=final_archive) ====================
+    auto_last = int(np.clip(int(np.round(N_GEN * 0.20)), 10, 20))
+    last_gens = auto_last if int(SAVE_BG_LAST_GENS) <= 0 else int(SAVE_BG_LAST_GENS)
+    last_gens = int(np.clip(last_gens, 1, N_GEN))
+    gens_keep = set(range(N_GEN - last_gens + 1, N_GEN + 1))  # gen 从 1..N_GEN
+
+    bg_rows: List[Dict[str, Any]] = []
+    for item in cb.feas_cache:
+        gen = int(item["gen"])
+        if gen not in gens_keep:
+            continue
+        Xg = item["X"]
+        Fg = item["F"]
+        Gg = item["G"]
+        for i in range(len(Xg)):
+            x = Xg[i]
+            suppr, deployEff, resEff, stealthEff = map(float, Fg[i])
+            cv_dist = float(Gg[i, 0]) if Gg.ndim == 2 else float(Gg[i])
+            chh = channel_hist_from_X(x)
+            n_valid_place = num_valid_place_from_X(problem, x)
+            bg_rows.append({
+                "algo_name": ALGO_NAME,
+                "run_id": RUN_ID,
+                "gen": gen,
+                "pool": "bg",
+                "is_pareto": 0,
+                "suppr": suppr,
+                "stealthEff": stealthEff,
+                "resEff": resEff,
+                "deployEff": deployEff,
+                "cv_dist": cv_dist,
+                "num_valid_place": n_valid_place,
+                **chh
+            })
+
+    if len(bg_rows) > int(SAVE_BG_MAX_POINTS):
+        rng_s = np.random.RandomState(RNG_SEED + 12345)
+        idx = rng_s.choice(len(bg_rows), size=int(SAVE_BG_MAX_POINTS), replace=False)
+        bg_rows = [bg_rows[i] for i in idx]
+
+    pareto_rows: List[Dict[str, Any]] = []
+    for i in range(cb.arc_F.shape[0]):
+        suppr, deployEff, resEff, stealthEff = map(float, cb.arc_F[i])
+        pareto_rows.append({
+            "algo_name": ALGO_NAME,
+            "run_id": RUN_ID,
+            "gen": N_GEN,
+            "pool": "pareto",
+            "is_pareto": 1,
+            "suppr": suppr,
+            "stealthEff": stealthEff,
+            "resEff": resEff,
+            "deployEff": deployEff,
+            "cv_dist": float(cb.arc_cv[i]),
+            "num_valid_place": "",
+            "ch600_count": "",
+            "ch6015_count": "",
+            "ch603_count": "",
+        })
+
+    solutions_rows = bg_rows + pareto_rows
+    solutions_path = f"{OUT_PREFIX}_solutions.csv"
+    solutions_fields = [
+        "algo_name", "run_id", "gen", "pool", "is_pareto",
+        "suppr", "stealthEff", "resEff", "deployEff",
+        "cv_dist", "num_valid_place",
+        "ch600_count", "ch6015_count", "ch603_count"
+    ]
+    write_csv_rows(solutions_path, solutions_rows, solutions_fields)
+    print(f"  ✅ Saved: {solutions_path}")
+    print(f"  (bg: last {last_gens} gens feasible, sampled to <= {SAVE_BG_MAX_POINTS}; pareto: final global archive)")
+
+    print("\n" + "=" * 70)
+    print("[OK] NSGA-II completed. Unified plotting files ready:")
+    print(f"  - Final Global ND Archive (scatter): {final_archive_path}")
+    print(f"  - HV convergence curve:             {hv_path}")
+    print(f"  - Pop history (optional/bg/debug):  {pop_history_path}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
