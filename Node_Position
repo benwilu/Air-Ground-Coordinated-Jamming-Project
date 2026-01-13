@@ -1,0 +1,903 @@
+"""
+通信节点部署系统 - 自然分布版（加入“12条关键接收链路”输出）
+
+
+【关键链路定义与输出】
+- 系统共有 12 个通信设备（3空 + 9地），每个设备必须对应 1 条“关键接收链路”（以该设备为 Rx）
+- 关键链路仅在“同频”节点之间选取（tx.ch == rx.ch，严格相等）
+- 关键链路优先选择 Rx 功率落在 [-80, -70] dBm 区间内
+- 最终仅输出 12 条关键接收链路（每设备 1 条），并打印其接收功率等信息
+
+- 同频 空-地（A2G）距离：>= 4.5 km（并保留上限 MAX_A2G_DIST）
+- 同频 地-地（G2G）距离：>= 3.0 km（并保留上限 MAX_G2G_DIST）
+- 不同频：不加这个距离约束（本程序部署本来按频点分组，跨组不参与该距离筛选）
+- 其余要求不变（接收功率目标区间不变、同频严格不变）
+
+【地形高度输出】
+- 在 [Node Configuration] 中增加输出：每个设备所在 cell 的地形高程 terrain=xx m（来自 hex_cells 的 elevation）
+"""
+
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import RegularPolygon, Patch
+from matplotlib.lines import Line2D
+from channel_path_loss_model import TerrainLoader, ChannelModel
+
+# ==================== Nature风格配置 ====================
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['font.size'] = 9
+plt.rcParams['axes.linewidth'] = 1.0
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==================== 系统参数 ====================
+CHANNELS = [600.0, 601.5, 603.0]
+
+AIR_POWER_BASE = 8.0
+GROUND_POWER_BASE = 20.0
+AIR_POWER_VAR = 2.0
+GROUND_POWER_VAR = 5.0
+
+GAIN_AIR = 2.0
+GAIN_GROUND = 2.5
+
+SENSITIVITY = -103.0
+MARGIN_G2G = 15.0
+MARGIN_A2G = 10.0
+
+THRESHOLD_G2G = SENSITIVITY + MARGIN_G2G
+THRESHOLD_A2G = SENSITIVITY + MARGIN_A2G
+
+AIR_HEIGHT = 2000.0
+GROUND_HEIGHT = 5.0
+
+# ==================== 距离约束（只对同频链路）====================
+MIN_G2G_DIST = 4.2    # km，同频地-地至少3.5km
+MAX_G2G_DIST = 10.0   # km，保留原上限，避免太远链路过不了门限
+MIN_A2G_DIST = 5      # km，同频空-地至少 4.5km
+MAX_A2G_DIST = 15.0   # km，保留原上限
+
+BOUNDARY_MARGIN = 2.5
+
+G2G_PREFERRED_POWER = (-85.0, -77.0)
+G2G_PREFERRED_DIST = (5.5, 9.5)
+
+TERRAIN_COLORS = ['#F1F8E9', '#C5E1A5', '#9CCC65', '#689F38', '#558B2F']
+CHANNEL_COLORS = ['#E53935', '#1E88E5', '#43A047']
+
+# ==================== 关键链路筛选参数 ====================
+KEY_RX_RANGE = (-80.0, -70.0)   # 关键链路接收功率目标区间（dBm）
+KEY_RX_TARGET = -75.0           # 区间中心，用于“最接近”选择
+KEY_RX_STRONG_EXCLUDE = -65.0
+
+
+# ==================== 邻居查找 ====================
+def get_neighbors(row, col):
+    if col % 2 == 0:
+        neighbors = [
+            (row - 1, col), (row + 1, col),
+            (row - 1, col - 1), (row, col - 1),
+            (row - 1, col + 1), (row, col + 1)
+        ]
+    else:
+        neighbors = [
+            (row - 1, col), (row + 1, col),
+            (row, col - 1), (row + 1, col - 1),
+            (row, col + 1), (row + 1, col + 1)
+        ]
+    return neighbors
+
+
+# ==================== 分布评估函数 ====================
+def evaluate_distribution(nodes, new_ground_coords):
+    if not nodes:
+        return 1.0
+
+    existing_ground = [(n['x'], n['y']) for n in nodes if n['type'] == 'ground']
+    if not existing_ground:
+        return 1.0
+
+    min_distances = []
+    for new_x, new_y in new_ground_coords:
+        distances = [np.sqrt((new_x - ex) ** 2 + (new_y - ey) ** 2) for ex, ey in existing_ground]
+        min_distances.append(min(distances) if distances else 100.0)
+
+    avg_min_dist = np.mean(min_distances)
+
+    if avg_min_dist >= 5.0:
+        return 1.0
+    elif avg_min_dist >= 3.0:
+        return 0.7 + 0.3 * (avg_min_dist - 3.0) / 2.0
+    else:
+        return 0.5 + 0.2 * (avg_min_dist / 3.0)
+
+
+# ==================== G2G 质量评估函数 ====================
+def evaluate_g2g_quality(rx_power_dbm, distance_km):
+    margin = rx_power_dbm - SENSITIVITY
+
+    if rx_power_dbm < THRESHOLD_G2G:
+        return 0.0, False, margin
+
+    target = -80.0
+    sigma = 4.0
+    dev = rx_power_dbm - target
+    power_score = np.exp(-(dev * dev) / (2.0 * sigma * sigma))
+    power_score = float(max(0.1, min(1.0, power_score)))
+
+    dmin, dmax = G2G_PREFERRED_DIST
+
+    if dmin <= distance_km <= dmax:
+        dist_score = 1.0
+    elif distance_km < dmin:
+        dist_score = 0.3 + 0.7 * (distance_km / dmin)
+    else:
+        over = distance_km - dmax
+        dist_score = max(0.6, 1.0 - over / dmax)
+
+    total_score = 0.7 * power_score + 0.3 * dist_score
+    return total_score, True, margin
+
+
+# ==================== 主函数 ====================
+def main():
+    print("=" * 70)
+    print("Communication Node Deployment System (Natural Distribution)")
+    print("=" * 70)
+    print(f"\n[System Requirements]")
+    print(f"  Sensitivity:         {SENSITIVITY:.1f} dBm")
+    print(f"  G2G Margin Required: {MARGIN_G2G:.1f} dB (Threshold: {THRESHOLD_G2G:.1f} dBm)")
+    print(f"  A2G Margin Required: {MARGIN_A2G:.1f} dB (Threshold: {THRESHOLD_A2G:.1f} dBm)")
+
+    print(f"\n[Distance Constraints (same-frequency only)]")
+    print(f"  A2G: {MIN_A2G_DIST:.2f} ~ {MAX_A2G_DIST:.2f} km")
+    print(f"  G2G: {MIN_G2G_DIST:.2f} ~ {MAX_G2G_DIST:.2f} km")
+
+    print(f"\n[Key Link Requirements]")
+    print(f"  Per-device key Rx link: 1 link per device (total 12)")
+    print(f"  Same-frequency only: tx.ch == rx.ch (strict)")
+    print(f"  Preferred Rx power: {KEY_RX_RANGE[0]:.1f} ~ {KEY_RX_RANGE[1]:.1f} dBm (target {KEY_RX_TARGET:.1f} dBm)")
+
+    print("\nLoading terrain data...")
+    terrain = TerrainLoader("terrain_data.json")
+    model = ChannelModel(terrain)
+
+    with open("terrain_data.json", 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    map_width = terrain.metadata['map_width']
+    map_height = terrain.metadata['map_height']
+
+    # ==================== 读取 jammer_candidates：每格 6 个候选点 ====================
+    jammer_pos_by_cell = {}
+    for key, cands in data.get("jammer_candidates", {}).items():
+        row, col = map(int, key.split(','))
+        pts = []
+        for idx, cand in enumerate(cands):
+            pts.append((float(cand["x"]), float(cand["y"]), float(cand.get("z", 0.0)), int(idx)))
+        jammer_pos_by_cell[(row, col)] = pts
+
+    def pick_point_in_cell(row, col, rng):
+        """从该格子的 jammer_candidates 中随机选一个点位；返回 (x,y,cand_idx)。"""
+        pts = jammer_pos_by_cell.get((row, col), [])
+        if not pts:
+            return None
+        sel = pts[int(rng.randint(len(pts)))]
+        return float(sel[0]), float(sel[1]), int(sel[3])
+
+    print("Filtering candidate positions...")
+    air_cands = []
+    ground_cands = []
+
+    for key, cell_data in data['hex_cells'].items():
+        elev = cell_data['elevation']
+        cx, cy = cell_data['center_x'], cell_data['center_y']
+        row, col = map(int, key.split(','))
+
+        if not (BOUNDARY_MARGIN <= cx <= map_width - BOUNDARY_MARGIN and
+                BOUNDARY_MARGIN <= cy <= map_height - BOUNDARY_MARGIN):
+            continue
+
+        # 必须该格子存在 jammer_candidates（否则无法按“6选1”落点）
+        if (row, col) not in jammer_pos_by_cell or len(jammer_pos_by_cell[(row, col)]) == 0:
+            continue
+
+        if 30 <= elev <= 120:
+            air_cands.append((cx, cy, elev, row, col))
+
+        if 150 <= elev <= 280:
+            ground_cands.append((cx, cy, elev, row, col))
+
+    print(f"  Air candidates (low terrain): {len(air_cands)}")
+    print(f"  Ground candidates (high terrain): {len(ground_cands)}")
+
+    if len(air_cands) == 0 or len(ground_cands) < 3:
+        print("[FAIL] Not enough candidates for deployment.")
+        return
+
+    occupied = set()
+    forbidden_all = set()
+    selected_cells = []
+
+    def calc_rx_power(tx_pos, rx_pos, tx_power_w, link_type):
+        result = model.calculate_path_loss(tx_pos, rx_pos, add_shadow=False)
+        tx_dbm = 10 * np.log10(tx_power_w * 1000)
+
+        if link_type == 'g2g':
+            gain_tx, gain_rx = GAIN_GROUND, GAIN_GROUND
+            threshold = THRESHOLD_G2G
+        else:
+            gain_tx = GAIN_AIR if tx_pos.z >= 1000 else GAIN_GROUND
+            gain_rx = GAIN_GROUND if rx_pos.z < 1000 else GAIN_AIR
+            threshold = THRESHOLD_A2G
+
+        rx_dbm = tx_dbm + gain_tx + gain_rx - result['L_total']
+        dist_km = result['distance_m'] / 1000.0
+        return rx_dbm, dist_km, rx_dbm >= threshold
+
+    print("\nDeploying nodes with natural distribution guidance...")
+    nodes = []
+    links = []
+
+    rng = np.random.RandomState(42)
+
+    for ch_id in range(3):
+        max_attempts = 30000
+        best_score = -1.0
+        best_config = None
+
+        for attempt in range(max_attempts):
+            air_power = AIR_POWER_BASE + rng.uniform(-AIR_POWER_VAR, AIR_POWER_VAR)
+            ground_powers = [
+                GROUND_POWER_BASE + rng.uniform(-GROUND_POWER_VAR, GROUND_POWER_VAR)
+                for _ in range(3)
+            ]
+
+            # 选 air 格子（仍按 elevation 筛选）
+            idx = rng.randint(len(air_cands))
+            _acx, _acy, a_cell_elev, arow, acol = air_cands[idx]
+
+            if (arow, acol) in occupied or (arow, acol) in forbidden_all:
+                continue
+
+            # 从该格子的 6 个候选点中选 1 个作为通信节点 x,y
+            ap = pick_point_in_cell(arow, acol, rng)
+            if ap is None:
+                continue
+            ax, ay, a_cand_idx = ap
+
+            air_pos = terrain.create_position(ax, ay, AIR_HEIGHT, frequency=CHANNELS[ch_id])
+
+            # 选 3 个 ground 格子
+            idxs = rng.choice(len(ground_cands), 3, replace=False)
+            grounds = []
+            ok = True
+
+            for gi in idxs:
+                _gcx, _gcy, g_cell_elev, grow, gcol = ground_cands[gi]
+                cell_g = (grow, gcol)
+
+                if cell_g in occupied or cell_g in forbidden_all:
+                    ok = False
+                    break
+
+                gp = pick_point_in_cell(grow, gcol, rng)
+                if gp is None:
+                    ok = False
+                    break
+                gx, gy, g_cand_idx = gp
+
+                grounds.append((gx, gy, g_cell_elev, grow, gcol, g_cand_idx))
+
+            if not ok:
+                continue
+
+            gx0, gy0, _, _, _, _ = grounds[0]
+            gx1, gy1, _, _, _, _ = grounds[1]
+            gx2, gy2, _, _, _, _ = grounds[2]
+
+            # ==================== 同频：地-地距离约束（>=3km，<=10km）====================
+            d01 = np.hypot(gx0 - gx1, gy0 - gy1)
+            d02 = np.hypot(gx0 - gx2, gy0 - gy2)
+            d12 = np.hypot(gx1 - gx2, gy1 - gy2)
+
+            if not (MIN_G2G_DIST <= d01 <= MAX_G2G_DIST and
+                    MIN_G2G_DIST <= d02 <= MAX_G2G_DIST and
+                    MIN_G2G_DIST <= d12 <= MAX_G2G_DIST):
+                continue
+
+            # ==================== 同频：空-地距离约束（>=4.5km，<=15km）====================
+            ag_dists = [
+                np.hypot(ax - gx0, ay - gy0),
+                np.hypot(ax - gx1, ay - gy1),
+                np.hypot(ax - gx2, ay - gy2)
+            ]
+            if any((d < MIN_A2G_DIST) or (d > MAX_A2G_DIST) for d in ag_dists):
+                continue
+
+            g_pos_objs = []
+            for (gx, gy, _cell_elev, _grow, _gcol, _gci) in grounds:
+                g_pos_objs.append(
+                    terrain.create_position(gx, gy, GROUND_HEIGHT, frequency=CHANNELS[ch_id])
+                )
+
+            # A2G：仍然要求门限通过（其余要求不变）
+            a2g_results = []
+            for i in range(3):
+                rx_ag, dist_ag, pass_ag = calc_rx_power(air_pos, g_pos_objs[i], air_power, 'a2g')
+                if not pass_ag:
+                    ok = False
+                    break
+                a2g_results.append((rx_ag, dist_ag))
+
+            if not ok:
+                continue
+
+            # G2G：仍然要求门限通过 + 质量评分（其余要求不变）
+            pairs = [(0, 1), (0, 2), (1, 2)]
+            g2g_results = []
+            g_scores = []
+            margins = []
+
+            for (i, j), tx_power in zip(pairs, [ground_powers[0], ground_powers[0], ground_powers[1]]):
+                gp_i = g_pos_objs[i]
+                gp_j = g_pos_objs[j]
+                rx_g, dist_g, pass_g = calc_rx_power(gp_i, gp_j, tx_power, 'g2g')
+                if not pass_g:
+                    ok = False
+                    break
+
+                score, accept, margin = evaluate_g2g_quality(rx_g, dist_g)
+                if not accept:
+                    ok = False
+                    break
+
+                g2g_results.append((i, j, rx_g, dist_g))
+                g_scores.append(score)
+                margins.append(margin)
+
+            if not ok:
+                continue
+
+            rx_list = [item[2] for item in g2g_results]
+            max_diff = max(rx_list) - min(rx_list) if len(rx_list) >= 2 else 0.0
+            uniform_score = max(0.5, 1.0 - max_diff / 10.0)
+
+            g2g_score = float(np.mean(g_scores) * uniform_score)
+            avg_margin = float(np.mean(margins))
+
+            dist_score = evaluate_distribution(
+                nodes,
+                [(grounds[0][0], grounds[0][1]),
+                 (grounds[1][0], grounds[1][1]),
+                 (grounds[2][0], grounds[2][1])]
+            )
+
+            combined_score = 0.6 * g2g_score + 0.4 * dist_score
+
+            if combined_score > best_score:
+                best_score = combined_score
+                best_config = {
+                    'air_cell': (arow, acol),
+                    'air_xy': (ax, ay, a_cand_idx),
+                    'air_power': air_power,
+                    'air_cell_elev': float(a_cell_elev),   #记录 air 所在cell的地形高程
+                    'grounds': grounds,
+                    'ground_powers': ground_powers,
+                    'a2g_results': a2g_results,
+                    'g2g_results': g2g_results,
+                    'avg_margin': avg_margin,
+                    'dist_score': dist_score
+                }
+
+            if combined_score >= 0.8:
+                break
+
+        if best_config is None:
+            print(f"  [FAIL] Channel {ch_id + 1} failed after {max_attempts} attempts")
+            return
+
+        (arow, acol) = best_config['air_cell']
+        (ax, ay, a_cand_idx) = best_config['air_xy']
+        air_power = best_config['air_power']
+        air_cell_elev = best_config['air_cell_elev']  # ✅
+        grounds = best_config['grounds']
+        ground_powers = best_config['ground_powers']
+        a2g_results = best_config['a2g_results']
+        g2g_results = best_config['g2g_results']
+        avg_margin = best_config['avg_margin']
+        dist_score = best_config['dist_score']
+
+        selected_cells.append((arow, acol, CHANNEL_COLORS[ch_id]))
+        for (_gx, _gy, _cell_elev, grow, gcol, _gci) in grounds:
+            selected_cells.append((grow, gcol, CHANNEL_COLORS[ch_id]))
+
+        channel_cells = [(arow, acol)] + [(g[3], g[4]) for g in grounds]
+
+        for cell_id in channel_cells:
+            occupied.add(cell_id)
+
+        for cell_id in channel_cells:
+            for neighbor in get_neighbors(*cell_id):
+                if neighbor not in occupied:
+                    forbidden_all.add(neighbor)
+
+        air_id = f'A{ch_id + 1}'
+        nodes.append({
+            'id': air_id, 'type': 'air',
+            'x': float(ax), 'y': float(ay), 'z': float(AIR_HEIGHT),
+            'ch': float(CHANNELS[ch_id]), 'power': float(air_power),
+            'row': int(arow), 'col': int(acol), 'cand_idx': int(a_cand_idx),
+            'terrain_elev': float(air_cell_elev)  # ✅ 新增：所在cell地形高程
+        })
+
+        g_ids = [f'G{ch_id * 3 + 1}', f'G{ch_id * 3 + 2}', f'G{ch_id * 3 + 3}']
+        for idx_g, (gx, gy, g_cell_elev, grow, gcol, g_cand_idx) in enumerate(grounds):
+            nodes.append({
+                'id': g_ids[idx_g], 'type': 'ground',
+                'x': float(gx), 'y': float(gy), 'z': float(GROUND_HEIGHT),
+                'ch': float(CHANNELS[ch_id]), 'power': float(ground_powers[idx_g]),
+                'row': int(grow), 'col': int(gcol), 'cand_idx': int(g_cand_idx),
+                'terrain_elev': float(g_cell_elev)  #所在cell地形高程
+            })
+
+        # 原有链路记录（用于可视化）
+        for i in range(3):
+            rx_ag, dist_ag = a2g_results[i]
+            links.append({
+                'tx': air_id,
+                'rx': g_ids[i],
+                'ch': ch_id,
+                'dist': float(dist_ag),
+                'rx_power': float(rx_ag),
+                'pass': True
+            })
+
+        for (i, j, rx_g, dist_g) in g2g_results:
+            links.append({
+                'tx': g_ids[i],
+                'rx': g_ids[j],
+                'ch': ch_id,
+                'dist': float(dist_g),
+                'rx_power': float(rx_g),
+                'pass': True
+            })
+
+        print(f"  [OK] Ch{ch_id + 1} ({CHANNELS[ch_id]}MHz) - {attempt + 1} attempts | "
+              f"G2G AvgMargin={avg_margin:.1f}dB, DistScore={dist_score:.2f}, "
+              f"CombinedScore={best_score:.3f}")
+
+    print("\n" + "=" * 70)
+    print("Deployment Results")
+    print("=" * 70)
+
+    print("\n[Node Configuration]  (now placed on jammer_candidates points)")
+    for node in nodes:
+        print(
+            f"  {node['id']}: ({node['x']:.3f}, {node['y']:.3f}) km, "
+            f"{node['ch']:.1f} MHz, {node['power']:.2f} W, type={node['type']}, "
+            f"terrain={node.get('terrain_elev', 0.0):.1f} m, "
+            f"cell=({node.get('row')},{node.get('col')})#p{node.get('cand_idx')}"
+        )
+
+    print("\n[Link Performance (for visualization/debug)]")
+    for link in links:
+        tx_node = next(n for n in nodes if n['id'] == link['tx'])
+        link_type = "G2G" if ('G' in link['tx'] and 'G' in link['rx']) else "A2G"
+        margin = link['rx_power'] - SENSITIVITY
+
+        print(f"  {link['tx']}->{link['rx']} [{link_type}]: "
+              f"{link['dist']:.2f}km, Rx={link['rx_power']:.1f}dBm, "
+              f"TxPower={tx_node['power']:.2f}W, Margin={margin:.1f}dB [PASS]")
+
+    # ==================== 关键链路：每设备 1 条（同频 + Rx功率集中 -70~-80）====================
+    print("\n" + "=" * 70)
+    print("Key Rx Links (12 links: 1 per device, same-frequency only)")
+    print("=" * 70)
+
+    pos_cache = {}
+    for n in nodes:
+        ant_h = AIR_HEIGHT if n['type'] == 'air' else GROUND_HEIGHT
+        pos_cache[n['id']] = terrain.create_position(n['x'], n['y'], ant_h, frequency=n['ch'])
+
+    def compute_rx_power_for_nodes(tx_node, rx_node):
+        if tx_node['ch'] != rx_node['ch']:
+            raise ValueError(
+                f"频率不匹配: {tx_node['id']}({tx_node['ch']}MHz) -> {rx_node['id']}({rx_node['ch']}MHz)"
+            )
+
+        tx_pos = pos_cache[tx_node['id']]
+        rx_pos = pos_cache[rx_node['id']]
+        link_type = 'g2g' if (tx_node['type'] == 'ground' and rx_node['type'] == 'ground') else 'a2g'
+
+        result = model.calculate_path_loss(tx_pos, rx_pos, add_shadow=False)
+        tx_dbm = 10 * np.log10(tx_node['power'] * 1000.0)
+
+        if link_type == 'g2g':
+            gain_tx, gain_rx = GAIN_GROUND, GAIN_GROUND
+        else:
+            gain_tx = GAIN_AIR if tx_node['type'] == 'air' else GAIN_GROUND
+            gain_rx = GAIN_AIR if rx_node['type'] == 'air' else GAIN_GROUND
+
+        rx_dbm = tx_dbm + gain_tx + gain_rx - result['L_total']
+        dist_km = result['distance_m'] / 1000.0
+        return rx_dbm, dist_km, link_type
+
+    key_links = []
+    for rx_node in nodes:
+        cands = []
+        for tx_node in nodes:
+            if tx_node['id'] == rx_node['id']:
+                continue
+            if tx_node['ch'] != rx_node['ch']:
+                continue  # 严格同频
+
+            rx_dbm, dist_km, lt = compute_rx_power_for_nodes(tx_node, rx_node)
+            cands.append({
+                'tx': tx_node['id'],
+                'rx': rx_node['id'],
+                'freq_mhz': rx_node['ch'],
+                'tx_power_w': tx_node['power'],
+                'dist_km': dist_km,
+                'rx_dbm': rx_dbm,
+                'link_type': lt
+            })
+
+        in_range = [c for c in cands if KEY_RX_RANGE[0] <= c['rx_dbm'] <= KEY_RX_RANGE[1]]
+
+        if in_range:
+            chosen = min(in_range, key=lambda c: abs(c['rx_dbm'] - KEY_RX_TARGET))
+        else:
+            not_too_strong = [c for c in cands if c['rx_dbm'] <= KEY_RX_RANGE[1]]
+            if not_too_strong:
+                chosen = min(not_too_strong, key=lambda c: abs(c['rx_dbm'] - KEY_RX_TARGET))
+            else:
+                chosen = min(cands, key=lambda c: c['rx_dbm']) if cands else None
+
+        if chosen is None:
+            print(f"  [WARN] {rx_node['id']}: no same-frequency candidate TX found.")
+            continue
+
+        key_links.append(chosen)
+
+    key_links_sorted = sorted(key_links, key=lambda x: x['rx'])
+    for kl in key_links_sorted:
+        tx = next(n for n in nodes if n['id'] == kl['tx'])
+        margin = kl['rx_dbm'] - SENSITIVITY
+        tag = ""
+        if not (KEY_RX_RANGE[0] <= kl['rx_dbm'] <= KEY_RX_RANGE[1]):
+            tag = "  [OUT_OF_RANGE]"
+        if kl['rx_dbm'] > -70.0:
+            tag = "  [TOO_STRONG]"
+        print(
+            f"  Rx={kl['rx']}  <-  Tx={kl['tx']}  "
+            f"({kl['link_type']}, {kl['freq_mhz']:.1f}MHz): "
+            f"Dist={kl['dist_km']:.2f}km, "
+            f"Rx={kl['rx_dbm']:.1f}dBm, "
+            f"TxPower={tx['power']:.2f}W, "
+            f"Margin={margin:.1f}dB{tag}"
+        )
+
+    # ==================== 生成干扰机候选位置（不区分类型）====================
+    print("\n" + "=" * 70)
+    print("生成干扰机候选位置（排除通信节点占用 + 邻居禁区）...")
+    print("=" * 70)
+
+    jammer_cands = []
+
+    for key, candidates in data['jammer_candidates'].items():
+        row, col = map(int, key.split(','))
+
+        if (row, col) in occupied or (row, col) in forbidden_all:
+            continue
+
+        for cand in candidates:
+            jammer_cands.append({
+                'x': cand['x'],
+                'y': cand['y'],
+                'z': cand['z'],
+                'row': row,
+                'col': col
+            })
+
+    print(f"\n[统计信息]")
+    print(f"  原始格子总数:          {len(data['hex_cells'])}")
+    print(f"  通信节点占用格子:      {len(occupied)}")
+    print(f"  邻居禁区格子:          {len(forbidden_all)}")
+    print(f"  可用格子数:            {len(data['hex_cells']) - len(occupied) - len(forbidden_all)}")
+    print(f"  可用干扰机候选位置:    {len(jammer_cands)} 个")
+
+    # ==================== 保存布设结果 JSON ====================
+    scenario = {
+        "nodes_comm": nodes,
+        "occupied": [list(c) for c in occupied],
+        "forbidden_all": [list(c) for c in forbidden_all],
+        "jammer_cands": jammer_cands,
+        "key_links_rx": key_links_sorted
+    }
+
+    with open("comm_scenario_natural.json", "w", encoding="utf-8") as f:
+        json.dump(scenario, f, indent=2, ensure_ascii=False)
+
+    print("\n[OK] 通信节点场景（含干扰机候选位置 + 关键链路）已保存为 comm_scenario_natural.json")
+    print("=" * 70 + "\n")
+
+    # ==================== 可视化（完全复制地形生成程序的绘图逻辑）====================
+    print("\nGenerating visualization...")
+
+    colors_terrain = ['#F1F8E9', '#C5E1A5', '#9CCC65', '#689F38', '#558B2F']
+    cmap_terrain = mcolors.LinearSegmentedColormap.from_list('terrain_cmap', colors_terrain)
+
+    fig = plt.figure(figsize=(16, 14), dpi=300, facecolor='white')
+    ax = plt.subplot(111)
+    ax.set_facecolor('#FAFAFA')
+
+    hex_radius = data['metadata']['hex_radius']
+    scale = data['metadata']['scale']
+
+    cell_color_map = {}
+    for row, col, color in selected_cells:
+        cell_color_map[(row, col)] = color
+
+    for key, cell_data in data['hex_cells'].items():
+        elev = cell_data['elevation']
+        cx = cell_data['center_x']
+        cy = cell_data['center_y']
+
+        color = cmap_terrain(elev / 300)
+
+        hexagon = RegularPolygon(
+            (cx, cy),
+            numVertices=6,
+            radius=hex_radius * scale,
+            orientation=np.radians(30),
+            facecolor=color,
+            edgecolor='#BDBDBD',
+            linewidth=0.3,
+            alpha=0.92,
+            zorder=1
+        )
+        ax.add_patch(hexagon)
+
+    for key, cell_data in data['hex_cells'].items():
+        row = cell_data['row']
+        col = cell_data['col']
+        cell_id = (row, col)
+
+        if cell_id in forbidden_all and cell_id not in cell_color_map:
+            cx = cell_data['center_x']
+            cy = cell_data['center_y']
+
+            overlay = RegularPolygon(
+                (cx, cy),
+                numVertices=6,
+                radius=hex_radius * scale * 0.92,
+                orientation=np.radians(30),
+                facecolor='#000000',
+                edgecolor='none',
+                alpha=0.08,
+                zorder=2
+            )
+            ax.add_patch(overlay)
+
+            hatch_hex = RegularPolygon(
+                (cx, cy),
+                numVertices=6,
+                radius=hex_radius * scale * 0.92,
+                orientation=np.radians(30),
+                facecolor='none',
+                edgecolor='#D32F2F',
+                linewidth=0.85,
+                hatch='///',
+                alpha=0.9,
+                zorder=3
+            )
+            ax.add_patch(hatch_hex)
+
+    for key, cell_data in data['hex_cells'].items():
+        row = cell_data['row']
+        col = cell_data['col']
+        cell_id = (row, col)
+
+        if cell_id in cell_color_map:
+            cx = cell_data['center_x']
+            cy = cell_data['center_y']
+
+            edge_hex = RegularPolygon(
+                (cx, cy),
+                numVertices=6,
+                radius=hex_radius * scale,
+                orientation=np.radians(30),
+                facecolor='none',
+                edgecolor=cell_color_map[cell_id],
+                linewidth=2.5,
+                alpha=0.95,
+                zorder=4
+            )
+            ax.add_patch(edge_hex)
+
+    ax.plot(
+        [BOUNDARY_MARGIN, map_width - BOUNDARY_MARGIN, map_width - BOUNDARY_MARGIN,
+         BOUNDARY_MARGIN, BOUNDARY_MARGIN],
+        [BOUNDARY_MARGIN, BOUNDARY_MARGIN, map_height - BOUNDARY_MARGIN,
+         map_height - BOUNDARY_MARGIN, BOUNDARY_MARGIN],
+        '--', color='#9E9E9E', linewidth=1.5, alpha=0.5, zorder=2
+    )
+
+    # marker 缩小：更容易看清“区域内具体点位”
+    AIR_MARKER_SIZE = 120
+    GROUND_MARKER_SIZE = 90
+
+    for ch_id in range(3):
+        color = CHANNEL_COLORS[ch_id]
+        ch_nodes = [n for n in nodes if n['ch'] == CHANNELS[ch_id]]
+        ch_links = [l for l in links if l['ch'] == ch_id]
+
+        for link in ch_links:
+            tx_node = next(n for n in nodes if n['id'] == link['tx'])
+            rx_node = next(n for n in nodes if n['id'] == link['rx'])
+
+            if 'G' in link['tx'] and 'G' in link['rx']:
+                style, width, alpha = '-', 2.5, 0.9
+            else:
+                style, width, alpha = '--', 2.0, 0.75
+
+            ax.plot(
+                [tx_node['x'], rx_node['x']],
+                [tx_node['y'], rx_node['y']],
+                linestyle=style, color=color, linewidth=width,
+                alpha=alpha, zorder=5
+            )
+
+        for node in ch_nodes:
+            if node['type'] == 'air':
+                marker, size, edge_width = '^', AIR_MARKER_SIZE, 2.2
+            else:
+                marker, size, edge_width = 'o', GROUND_MARKER_SIZE, 2.0
+
+            ax.scatter(
+                node['x'], node['y'],
+                marker=marker, s=size, c=color,
+                edgecolors='white', linewidths=edge_width,
+                alpha=0.95, zorder=10
+            )
+
+            # label：包含 cell 与候选点编号
+            rc = f"({node.get('row')},{node.get('col')})#p{node.get('cand_idx')}"
+            ax.text(
+                node['x'], node['y'] - 0.9,
+                f"{node['id']} {node['ch']:.1f}MHz\n{rc}",
+                ha='center', va='top',
+                fontsize=7.6, fontweight='bold',
+                color=color,
+                bbox=dict(
+                    boxstyle='round,pad=0.25',
+                    facecolor='white',
+                    edgecolor=color,
+                    linewidth=1.2,
+                    alpha=0.95
+                ),
+                zorder=11
+            )
+
+    ax.set_xlim(-1, map_width + 1)
+    ax.set_ylim(-1, map_height + 1)
+    ax.set_aspect('equal')
+
+    ax.grid(True, linestyle=':', alpha=0.25, linewidth=0.5, color='#9E9E9E')
+    ax.set_axisbelow(True)
+
+    ax.set_xlabel('X Coordinate (km)', fontsize=12, fontweight='bold',
+                  color='#424242', labelpad=10)
+    ax.set_ylabel('Y Coordinate (km)', fontsize=12, fontweight='bold',
+                  color='#424242', labelpad=10)
+
+    ax.tick_params(axis='both', which='major', labelsize=10,
+                   colors='#616161', width=0.8, length=5)
+
+    ax.set_title(
+        'Communication Node Deployment\n'
+        'Based on Hexagonal Terrain with Natural Distribution',
+        fontsize=14, fontweight='bold', pad=20, color='#1976D2'
+    )
+
+    legend_elements = [
+        Patch(facecolor=colors_terrain[0], edgecolor='#BDBDBD',
+              label='Plains (0-50m)', linewidth=1.0),
+        Patch(facecolor=colors_terrain[2], edgecolor='#BDBDBD',
+              label='Hills (50-220m)', linewidth=1.0),
+        Patch(facecolor=colors_terrain[4], edgecolor='#BDBDBD',
+              label='Mountains (220+ m)', linewidth=1.0),
+        Patch(facecolor='white', edgecolor='#D32F2F', hatch='///',
+              label='Forbidden Area', linewidth=2.0),
+        Line2D([0], [0], marker='^', color='w', markerfacecolor='#E53935',
+              markersize=10, markeredgecolor='white', markeredgewidth=2,
+              label='Air Node (2000m)', linestyle='None'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#1E88E5',
+              markersize=9, markeredgecolor='white', markeredgewidth=2,
+              label='Ground Node (5m)', linestyle='None'),
+        Line2D([0], [0], color='#424242', linestyle='-', linewidth=2.5,
+              label='Ground-to-Ground Link'),
+        Line2D([0], [0], color='#424242', linestyle='--', linewidth=2,
+              label='Air-to-Ground Link')
+    ]
+
+    ax.legend(
+        handles=legend_elements,
+        loc='upper left',
+        fontsize=9,
+        framealpha=0.95,
+        frameon=True,
+        edgecolor='#BDBDBD',
+        fancybox=False,
+        facecolor='white'
+    )
+
+    total_nodes = len(nodes)
+    air_nodes = sum(1 for n in nodes if n['type'] == 'air')
+    ground_nodes = total_nodes - air_nodes
+    total_links = len(links)
+    g2g_links = [l for l in links if 'G' in l['tx'] and 'G' in l['rx']]
+    a2g_links = [l for l in links if not ('G' in l['tx'] and 'G' in l['rx'])]
+
+    avg_air_power = np.mean([n['power'] for n in nodes if n['type'] == 'air'])
+    avg_ground_power = np.mean([n['power'] for n in nodes if n['type'] == 'ground'])
+    avg_g2g_rx = np.mean([l['rx_power'] for l in g2g_links]) if g2g_links else 0.0
+    avg_g2g_dist = np.mean([l['dist'] for l in g2g_links]) if g2g_links else 0.0
+    avg_g2g_margin = avg_g2g_rx - SENSITIVITY
+
+    stats_text = (
+        f"Deployment Statistics\n"
+        f"{'_' * 22}\n"
+        f"Total Nodes:        {total_nodes}\n"
+        f"  Air Nodes:        {air_nodes}\n"
+        f"  Ground Nodes:     {ground_nodes}\n"
+        f"Total Links:        {total_links}\n"
+        f"  Air-Ground:       {len(a2g_links)}\n"
+        f"  Ground-Ground:    {len(g2g_links)}\n"
+        f"{'_' * 22}\n"
+        f"Avg Air Power:    {avg_air_power:.2f} W\n"
+        f"Avg Ground Power: {avg_ground_power:.2f} W\n"
+        f"Air Gain:         {GAIN_AIR:.1f} dBi\n"
+        f"Ground Gain:      {GAIN_GROUND:.1f} dBi\n"
+        f"{'_' * 22}\n"
+        f"G2G Avg Rx:      {avg_g2g_rx:.1f} dBm\n"
+        f"G2G Avg Margin:   {avg_g2g_margin:.1f} dB\n"
+        f"G2G Avg Dist:     {avg_g2g_dist:.2f} km\n"
+        f"{'_' * 22}\n"
+        f"Forbidden cells:  {len(forbidden_all)}\n"
+        f"Jammer cands:     {len(jammer_cands)}\n"
+        f"All Links: PASS"
+    )
+
+    fig.text(
+        0.02, 0.02, stats_text,
+        fontsize=8.5, ha='left', va='bottom',
+        bbox=dict(
+            boxstyle='round,pad=0.8',
+            facecolor='white',
+            edgecolor='#757575',
+            linewidth=1.0,
+            alpha=0.95
+        ),
+        fontfamily='monospace',
+        fontweight='normal',
+        color='#424242',
+        linespacing=1.4
+    )
+
+    plt.tight_layout(rect=[0, 0.05, 1, 0.98])
+    plt.savefig('deployment_natural_distribution.png', dpi=300,
+                bbox_inches='tight', facecolor='white', edgecolor='none')
+
+    print("[OK] Visualization saved: deployment_natural_distribution.png")
+    print("\n" + "=" * 70)
+    print("[OK] All tasks completed!")
+    print("=" * 70 + "\n")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
