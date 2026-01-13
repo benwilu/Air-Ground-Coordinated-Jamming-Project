@@ -1,0 +1,485 @@
+
+
+import numpy as np
+import json
+import random
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import RegularPolygon, Patch
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
+
+
+@dataclass
+class HexCell:
+    """六边形蜂窝单元"""
+    row: int
+    col: int
+    elevation: float
+    terrain_type: str
+    center_x: float
+    center_y: float
+    has_forest: bool = False
+    jammer_candidates: List[Tuple[float, float, float]] = None
+
+
+class TerrainGenerator:
+    """地形生成器"""
+
+    def __init__(self, rows=16, cols=16, map_width=25, map_height=25):
+        self.rows = rows
+        self.cols = cols
+        self.map_width = map_width
+        self.map_height = map_height
+        self.hex_radius = 1.0
+        self.hex_cells: Dict[Tuple[int, int], HexCell] = {}
+
+        random.seed(42)
+        np.random.seed(42)
+
+        self._generate_terrain()
+        self._create_hex_grid()
+        self._generate_jammer_candidates()
+
+    def _generate_terrain(self):
+        """生成地形高程数据"""
+        self.terrain_grid = np.zeros((self.rows, self.cols))
+        mountain_centers = [(4, 4), (5, 12), (11, 3), (12, 11)]
+        hill_centers = [(2, 7), (7, 2), (8, 8), (13, 6), (7, 13)]
+
+        for i in range(self.rows):
+            for j in range(self.cols):
+                mountain_distances = [np.sqrt((i - c[0]) ** 2 + (j - c[1]) ** 2) for c in mountain_centers]
+                min_mountain_distance = min(mountain_distances) if mountain_distances else 20
+                hill_distances = [np.sqrt((i - c[0]) ** 2 + (j - c[1]) ** 2) for c in hill_centers]
+                min_hill_distance = min(hill_distances) if hill_distances else 20
+
+                if min_mountain_distance < 1.2:
+                    self.terrain_grid[i, j] = random.randint(260, 280)
+                elif min_mountain_distance < 2.0:
+                    self.terrain_grid[i, j] = random.randint(220, 260)
+                elif min_mountain_distance < 2.8:
+                    self.terrain_grid[i, j] = random.randint(160, 220)
+                elif min_hill_distance < 2:
+                    self.terrain_grid[i, j] = random.randint(120, 180)
+                elif min_hill_distance < 3:
+                    self.terrain_grid[i, j] = random.randint(80, 120)
+                else:
+                    self.terrain_grid[i, j] = random.randint(10, 50)
+
+    def _get_hex_center(self, row: int, col: int) -> Tuple[float, float]:
+        """计算六边形中心坐标"""
+        x = col * self.hex_radius * 1.5
+        y = row * self.hex_radius * np.sqrt(3)
+        if col % 2 == 1:
+            y += self.hex_radius * np.sqrt(3) / 2
+        return x, y
+
+    def _create_hex_grid(self):
+        """创建蜂窝网格"""
+        grid_width = (self.cols - 1) * self.hex_radius * 1.5 + self.hex_radius * 2
+        grid_height = (self.rows - 1) * self.hex_radius * np.sqrt(3) + self.hex_radius * np.sqrt(3)
+
+        scale_x = self.map_width / grid_width
+        scale_y = self.map_height / grid_height
+        self.scale = max(scale_x, scale_y) * 1.02
+
+        scaled_width = grid_width * self.scale
+        scaled_height = grid_height * self.scale
+
+        self.offset_x = (self.map_width - scaled_width) / 2
+        self.offset_y = (self.map_height - scaled_height) / 2
+
+        for row in range(self.rows):
+            for col in range(self.cols):
+                elevation = self.terrain_grid[row, col]
+                base_x, base_y = self._get_hex_center(row, col)
+                center_x = base_x * self.scale + self.offset_x
+                center_y = base_y * self.scale + self.offset_y
+
+                if elevation >= 220:
+                    terrain_type = "mountain"
+                elif elevation >= 100:
+                    terrain_type = "high_hill"
+                elif elevation >= 50:
+                    terrain_type = "low_hill"
+                else:
+                    terrain_type = "plain"
+
+                has_forest = bool(30 <= elevation <= 80 and random.random() < 0.15)
+
+                self.hex_cells[(row, col)] = HexCell(
+                    row=row, col=col,
+                    elevation=float(elevation),
+                    terrain_type=terrain_type,
+                    center_x=float(center_x),
+                    center_y=float(center_y),
+                    has_forest=has_forest,
+                    jammer_candidates=[]
+                )
+
+    def _generate_jammer_candidates(self):
+        """为每个蜂窝区域生成6个候选干扰机位置"""
+        for cell in self.hex_cells.values():
+            vertices = []
+            for i in range(6):
+                angle_deg = 60 * i - 30
+                angle_rad = np.pi / 180 * angle_deg
+                x = cell.center_x + self.hex_radius * self.scale * np.cos(angle_rad)
+                y = cell.center_y + self.hex_radius * self.scale * np.sin(angle_rad)
+                vertices.append((x, y))
+
+            diagonals = [
+                (vertices[0], vertices[3]),
+                (vertices[1], vertices[4]),
+                (vertices[2], vertices[5])
+            ]
+
+            for start, end in diagonals:
+                x1 = start[0] + 0.25 * (end[0] - start[0])
+                y1 = start[1] + 0.25 * (end[1] - start[1])
+                x2 = start[0] + 0.75 * (end[0] - start[0])
+                y2 = start[1] + 0.75 * (end[1] - start[1])
+
+                cell.jammer_candidates.append((x1, y1, cell.elevation))
+                cell.jammer_candidates.append((x2, y2, cell.elevation))
+
+    def save_terrain_data(self, filename: str):
+        """保存地形数据到JSON文件"""
+        data = {
+            "metadata": {
+                "rows": int(self.rows),
+                "cols": int(self.cols),
+                "map_width": float(self.map_width),
+                "map_height": float(self.map_height),
+                "hex_radius": float(self.hex_radius),
+                "scale": float(self.scale),
+                "offset_x": float(self.offset_x),
+                "offset_y": float(self.offset_y)
+            },
+            "terrain_grid": self.terrain_grid.tolist(),
+            "hex_cells": {},
+            "jammer_candidates": {}
+        }
+
+        for (row, col), cell in self.hex_cells.items():
+            data["hex_cells"][f"{row},{col}"] = {
+                "row": int(cell.row),
+                "col": int(cell.col),
+                "elevation": float(cell.elevation),
+                "terrain_type": str(cell.terrain_type),
+                "center_x": float(cell.center_x),
+                "center_y": float(cell.center_y),
+                "has_forest": bool(cell.has_forest)
+            }
+
+            data["jammer_candidates"][f"{row},{col}"] = [
+                {"x": float(x), "y": float(y), "z": float(z)}
+                for x, y, z in cell.jammer_candidates
+            ]
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"地形数据已保存到: {filename}")
+
+        total_candidates = sum(len(cell.jammer_candidates) for cell in self.hex_cells.values())
+        print(f"总共生成 {total_candidates} 个候选干扰机位置")
+
+    def create_combined_visualization(self, filename="terrain_combined.png"):
+        """创建Nature风格的联合可视化（保持原有逻辑）"""
+
+        # ========== 配色方案 ==========
+        colors_terrain = [
+            '#F1F8E9',  # 平原 - 浅绿
+            '#C5E1A5',  # 低丘陵 - 青绿
+            '#9CCC65',  # 高丘陵 - 草绿
+            '#689F38',  # 山地 - 深绿
+            '#558B2F'  # 高山 - 墨绿
+        ]
+        cmap_terrain = mcolors.LinearSegmentedColormap.from_list('terrain_cmap', colors_terrain)
+
+        # ========== 字体设置 ==========
+        plt.rcParams['font.family'] = 'Arial'
+        plt.rcParams['font.size'] = 9
+        plt.rcParams['axes.linewidth'] = 1.0
+        plt.rcParams['axes.unicode_minus'] = False
+
+        # 创建画布
+        fig = plt.figure(figsize=(20, 9), dpi=300, facecolor='white')
+
+        # ============== 2D地形图（左侧） ==============
+        ax1 = fig.add_subplot(1, 2, 1)
+        ax1.set_facecolor('#FAFAFA')
+
+        # 绘制六边形蜂窝
+        for cell in self.hex_cells.values():
+            color = cmap_terrain(cell.elevation / 300)
+
+            hexagon = RegularPolygon(
+                (cell.center_x, cell.center_y),
+                numVertices=6,
+                radius=self.hex_radius * self.scale,
+                orientation=np.radians(30),
+                facecolor=color,
+                edgecolor='#BDBDBD',  # Nature柔和灰
+                linewidth=0.3,  # 更细的线条
+                alpha=0.92
+            )
+            ax1.add_patch(hexagon)
+
+            #标记森林（精致样式）
+            if cell.has_forest:
+                ax1.plot(cell.center_x, cell.center_y, '^',
+                         color='#2E7D32', markersize=8, alpha=0.95,
+                         markeredgecolor='white', markeredgewidth=0.8)
+
+            #  显示海拔高度
+            center_x, center_y = self.map_width / 2, self.map_height / 2
+            dist_from_center = np.sqrt((cell.center_x - center_x) ** 2 +
+                                       (cell.center_y - center_y) ** 2)
+
+            if dist_from_center < self.map_width * 0.55:
+                if cell.elevation > 180:
+                    label_color = '#FFFFFF'
+                    label_weight = 'bold'
+                else:
+                    label_color = '#424242'
+                    label_weight = 'normal'
+
+                ax1.text(cell.center_x, cell.center_y, f'{int(cell.elevation)}',
+                         ha='center', va='center', fontsize=6.5,
+                         fontweight=label_weight,
+                         color=label_color, alpha=0.85)
+
+        # 绘制候选干扰机位置
+        all_candidates = []
+        candidate_colors = []
+
+        # 使用Nature配色
+        nature_colors = [
+            '#1976D2', '#FB8C00', '#66BB6A', '#EF5350',
+            '#7E57C2', '#26A69A', '#FFA726', '#EC407A',
+            '#5C6BC0', '#26C6DA', '#9CCC65', '#FF7043',
+            '#AB47BC', '#42A5F5', '#FFA726', '#8D6E63',
+            '#29B6F6', '#66BB6A', '#FFCA28', '#EC407A'
+        ]
+
+        for idx, cell in enumerate(self.hex_cells.values()):
+            color = nature_colors[idx % len(nature_colors)]
+            for x, y, z in cell.jammer_candidates:
+                all_candidates.append((x, y))
+                candidate_colors.append(color)
+
+        if all_candidates:
+            xs, ys = zip(*all_candidates)
+            ax1.scatter(xs, ys, c=candidate_colors, s=25,
+                        alpha=0.75, edgecolors='white', linewidths=0.6,
+                        marker='o', zorder=5)
+
+
+        ax1.set_xlim(-1, self.map_width + 1)
+        ax1.set_ylim(-1, self.map_height + 1)
+        ax1.set_aspect('equal')
+
+        # 更细腻的网格
+        ax1.grid(True, linestyle=':', alpha=0.25, linewidth=0.5, color='#9E9E9E')
+        ax1.set_axisbelow(True)
+
+        # 坐标轴标签
+        ax1.set_xlabel('X Coordinate (km)', fontsize=12, fontweight='bold',
+                       color='#424242', labelpad=8)
+        ax1.set_ylabel('Y Coordinate (km)', fontsize=12, fontweight='bold',
+                       color='#424242', labelpad=8)
+        ax1.set_title('2D Hexagonal Terrain Map\nwith Jammer Candidate Positions',
+                      fontsize=13, fontweight='bold', pad=15, color='#1976D2')
+
+        # 刻度美化
+        ax1.tick_params(axis='both', which='major', labelsize=9,
+                        colors='#616161', width=0.8, length=5)
+
+        # 图例
+        legend_elements = [
+            Patch(facecolor=colors_terrain[0], edgecolor='#BDBDBD',
+                  label='Plains (0-50m)', linewidth=1.0),
+            Patch(facecolor=colors_terrain[1], edgecolor='#BDBDBD',
+                  label='Low Hills (50-100m)', linewidth=1.0),
+            Patch(facecolor=colors_terrain[2], edgecolor='#BDBDBD',
+                  label='High Hills (100-220m)', linewidth=1.0),
+            Patch(facecolor=colors_terrain[3], edgecolor='#BDBDBD',
+                  label='Mountains (220+ m)', linewidth=1.0),
+            plt.Line2D([0], [0], marker='^', color='w',
+                       markerfacecolor='#2E7D32', markeredgecolor='white',
+                       markersize=10, label='Forest Area', markeredgewidth=0.8),
+            plt.Line2D([0], [0], marker='o', color='w',
+                       markerfacecolor='#FB8C00', markeredgecolor='white',
+                       markersize=8, label='Jammer Candidate', markeredgewidth=0.6)
+        ]
+
+        ax1.legend(handles=legend_elements, loc='upper left',
+                   framealpha=0.95, fontsize=9.5, frameon=True,
+                   edgecolor='#BDBDBD', fancybox=False,
+                   facecolor='white')
+
+        # ============== 3D地形可视化（右侧） ==============
+        ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+
+        # 准备3D数据
+        x_coords = np.array([cell.center_x for cell in self.hex_cells.values()])
+        y_coords = np.array([cell.center_y for cell in self.hex_cells.values()])
+        z_coords = np.array([cell.elevation for cell in self.hex_cells.values()])
+
+        # 创建高分辨率网格
+        from scipy.interpolate import griddata
+
+        grid_x, grid_y = np.meshgrid(
+            np.linspace(x_coords.min(), x_coords.max(), 80),
+            np.linspace(y_coords.min(), y_coords.max(), 80)
+        )
+
+        grid_z = griddata((x_coords, y_coords), z_coords,
+                          (grid_x, grid_y), method='cubic')
+
+        # 绘制3D曲面（绿色配色）
+        surf = ax2.plot_surface(grid_x, grid_y, grid_z,
+                                cmap=cmap_terrain,
+                                alpha=0.88,
+                                edgecolor='none',
+                                antialiased=True,
+                                shade=True,
+                                rstride=1, cstride=1,
+                                linewidth=0)
+
+        # 坐标轴美化
+        ax2.set_xlabel('X (km)', fontsize=11, fontweight='bold',
+                       labelpad=10, color='#424242')
+        ax2.set_ylabel('Y (km)', fontsize=11, fontweight='bold',
+                       labelpad=10, color='#424242')
+        ax2.set_zlabel('Elevation (m)', fontsize=11, fontweight='bold',
+                       labelpad=10, color='#424242')
+
+        # 设置最佳视角
+        ax2.view_init(elev=30, azim=45)
+
+        # 背景透明化
+        ax2.xaxis.pane.fill = False
+        ax2.yaxis.pane.fill = False
+        ax2.zaxis.pane.fill = False
+
+        # 网格优化
+        ax2.xaxis.pane.set_edgecolor('#BDBDBD')
+        ax2.yaxis.pane.set_edgecolor('#BDBDBD')
+        ax2.zaxis.pane.set_edgecolor('#BDBDBD')
+        ax2.grid(True, linestyle=':', alpha=0.25, color='#9E9E9E', linewidth=0.5)
+
+        # 刻度美化
+        ax2.tick_params(axis='both', which='major', labelsize=8.5,
+                        colors='#616161', pad=5)
+
+        # 标题
+        ax2.set_title('3D Terrain Surface\n(Pure Topographic Visualization)',
+                      fontsize=13, fontweight='bold', pad=20, color='#1976D2')
+
+        # 颜色条美化
+        sm = plt.cm.ScalarMappable(cmap=cmap_terrain,
+                                   norm=plt.Normalize(vmin=0, vmax=300))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax2, shrink=0.7, pad=0.1, aspect=20)
+        cbar.set_label('Elevation (m)', fontsize=10, fontweight='bold',
+                       rotation=270, labelpad=18)
+        cbar.ax.tick_params(labelsize=8.5)
+        cbar.outline.set_edgecolor('#BDBDBD')
+        cbar.outline.set_linewidth(1.0)
+
+        # 总标题
+        fig.suptitle('Advanced Terrain Model with Communication Infrastructure',
+                     fontsize=15, fontweight='bold', y=0.97, color='#1976D2')
+
+        #统计信息框（简洁样式）
+        stats_text = (
+            f"Terrain Statistics\n"
+            f"{'─' * 18}\n"
+            f"Total Cells: {len(self.hex_cells)}\n"
+            f"Max Elevation: {np.max(z_coords):.0f} m\n"
+            f"Min Elevation: {np.min(z_coords):.0f} m\n"
+            f"Avg Elevation: {np.mean(z_coords):.1f} m\n"
+            f"Forest Cells: {sum(1 for c in self.hex_cells.values() if c.has_forest)}\n"
+            f"Jammer Candidates: {sum(len(c.jammer_candidates) for c in self.hex_cells.values())}"
+        )
+
+        fig.text(0.02, 0.02, stats_text,
+                 fontsize=8.5, ha='left', va='bottom',
+                 bbox=dict(boxstyle='round,pad=0.8', facecolor='white',
+                           edgecolor='#757575', linewidth=1.0, alpha=0.95),
+                 fontfamily='monospace', fontweight='normal',
+                 color='#424242', linespacing=1.4)
+
+        # 保存
+        plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+        plt.savefig(filename, dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+
+        print(f"可视化图像已保存到: {filename}")
+
+        plt.show()
+        return fig
+
+    def get_terrain_statistics(self):
+        """获取地形统计信息"""
+        elevations = [cell.elevation for cell in self.hex_cells.values()]
+        terrain_types = [cell.terrain_type for cell in self.hex_cells.values()]
+
+        stats = {
+            'total_cells': len(self.hex_cells),
+            'max_elevation': float(np.max(elevations)),
+            'min_elevation': float(np.min(elevations)),
+            'avg_elevation': float(np.mean(elevations)),
+            'terrain_distribution': {},
+            'forest_cells': sum(1 for cell in self.hex_cells.values() if cell.has_forest),
+            'total_jammer_candidates': sum(len(cell.jammer_candidates) for cell in self.hex_cells.values())
+        }
+
+        for terrain_type in set(terrain_types):
+            count = terrain_types.count(terrain_type)
+            stats['terrain_distribution'][terrain_type] = {
+                'count': count,
+                'percentage': count / len(terrain_types) * 100
+            }
+
+        return stats
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("🎨 地形生成器")
+    print("=" * 70)
+
+    print("\n正在生成地形数据...")
+    terrain_gen = TerrainGenerator()
+
+    terrain_gen.save_terrain_data("terrain_data.json")
+
+    stats = terrain_gen.get_terrain_statistics()
+
+    print(f"\n地形统计:")
+    print(f"  总蜂窝单元: {stats['total_cells']}")
+    print(f"  最高海拔: {stats['max_elevation']:.1f}m")
+    print(f"  最低海拔: {stats['min_elevation']:.1f}m")
+    print(f"  平均海拔: {stats['avg_elevation']:.1f}m")
+    print(f"  森林单元: {stats['forest_cells']}")
+    print(f"  候选干扰机位置: {stats['total_jammer_candidates']}")
+
+    print("\n地形类型分布:")
+    for terrain_type, data in stats['terrain_distribution'].items():
+        print(f"  {terrain_type}: {data['count']}个单元 ({data['percentage']:.1f}%)")
+
+    print("\n正在生成可视化...")
+    terrain_gen.create_combined_visualization("terrain_combined.png")
+
+    print("\n" + "=" * 70)
+    print("✅ 所有任务完成!")
+    print("=" * 70)
+    print("输出文件:")
+    print("  📄 terrain_data.json (地形数据)")
+    print("  🎨 terrain_combined.png (可视化)")
+    print("=" * 70 + "\n")
