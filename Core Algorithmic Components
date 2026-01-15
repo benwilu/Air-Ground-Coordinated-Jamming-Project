@@ -1,0 +1,613 @@
+import json
+import numpy as np
+from typing import List, Dict, Any
+
+from pymoo.core.problem import Problem
+from pymoo.optimize import minimize
+from pymoo.core.sampling import Sampling
+from pymoo.algorithms.moo.nsga3 import NSGA3
+from pymoo.core.crossover import Crossover
+from pymoo.core.mutation import Mutation
+from pymoo.util.ref_dirs import get_reference_directions
+
+from channel_path_loss_model import TerrainLoader, ChannelModel
+
+# 基本参数
+NUM_JAMMERS = 12
+POP_SIZE = 30
+N_GEN = 50
+RNG_SEED = 42
+ADD_SHADOW = False
+XY_TO_KM = 1.0
+MIN_SAME_CH_JAMMER_DIST = 5.0
+
+CHANNELS = [600.0, 601.5, 603.0]
+GAIN_AIR = 2.0
+GAIN_GROUND = 2.5
+JSR_THRESHOLD = 4.77
+J_GAIN_GROUND = 2.0
+J_GAIN_AIR = 1.5
+P_GROUND_MAX = 20.0
+P_AIR_MAX = 10.0
+JAMMER_AIR_HEIGHT = 2000.0
+JAMMER_GROUND_HEIGHT = 2.0
+
+# 离散算子超参
+P_MUT_JAMMER = 0.50
+P_MUT_POS = 0.88
+P_MUT_TYPE = 0.08
+P_MUT_CH = 0.15
+P_MUT_POW = 0.30
+POS_SCALE_PROBS = {"r0": 0.03, "r1": 0.22, "r23": 0.50, "global": 0.25}
+HEX_NEI_DELTAS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, 1), (1, -1)]
+
+# LHS采样算法
+class LHS_TypeChPow_SamplingPaper(Sampling):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def _u01_vec(rnd, n):
+        if hasattr(rnd, "random"):
+            return rnd.random(n)
+        return rnd.random_sample(n)
+
+    @staticmethod
+    def _perm_1_to_N(rnd, N):
+        return rnd.permutation(N) + 1
+
+    def _lhs_int_1d(self, rnd, N, L, U):
+        L = float(L); U = float(U)
+        pi = self._perm_1_to_N(rnd, N).astype(float)
+        r = self._u01_vec(rnd, N).astype(float)
+        x_cont = L + ((pi - r) / float(N)) * (U - L)
+        x_int = np.floor(x_cont + 0.5)
+        x_int = np.clip(x_int, L, U).astype(int)
+        return x_int
+
+    def _rand_int_vec(self, rnd, lo, hi_inclusive, n):
+        if hasattr(rnd, "integers"):
+            return rnd.integers(lo, hi_inclusive + 1, size=n, dtype=int)
+        return rnd.randint(lo, hi_inclusive + 1, size=n).astype(int)
+
+    def _do(self, problem, n_samples, **kwargs):
+        rnd = kwargs.get("random_state", np.random)
+        N = int(n_samples)
+        n_var = int(problem.n_var)
+        xl = np.asarray(problem.xl, dtype=int)
+        xu = np.asarray(problem.xu, dtype=int)
+        X = np.empty((N, n_var), dtype=int)
+
+        for d in range(n_var):
+            X[:, d] = self._rand_int_vec(rnd, int(xl[d]), int(xu[d]), N)
+
+        for k in range(NUM_JAMMERS):
+            base = 4 * k
+            d_type = base + 1
+            d_ch = base + 2
+            d_pow = base + 3
+            X[:, d_type] = self._lhs_int_1d(rnd, N, xl[d_type], xu[d_type])
+            X[:, d_ch] = self._lhs_int_1d(rnd, N, xl[d_ch], xu[d_ch])
+            X[:, d_pow] = self._lhs_int_1d(rnd, N, xl[d_pow], xu[d_pow])
+
+        X = np.clip(X, xl, xu).astype(int)
+        return X
+
+# 地形蜂窝邻接图
+class CellGraph:
+    def __init__(self, cell_set, deltas=HEX_NEI_DELTAS):
+        self.cell_set = set(cell_set)
+        self.deltas = list(deltas)
+        self._ring_cache = {}
+
+    def neighbors(self, cell):
+        r, c = cell
+        out = []
+        for dr, dc in self.deltas:
+            nb = (r + dr, c + dc)
+            if nb in self.cell_set:
+                out.append(nb)
+        return out
+
+    def ring(self, cell, r_hop):
+        key = (cell, int(r_hop))
+        if key in self._ring_cache:
+            return self._ring_cache[key]
+
+        r_hop = int(r_hop)
+        if r_hop <= 0:
+            self._ring_cache[key] = [cell] if cell in self.cell_set else []
+            return self._ring_cache[key]
+
+        visited = {cell: 0}
+        frontier = [cell]
+        d = 0
+        while frontier and d < r_hop:
+            nxt = []
+            d += 1
+            for u in frontier:
+                for v in self.neighbors(u):
+                    if v not in visited:
+                        visited[v] = d
+                        nxt.append(v)
+            frontier = nxt
+
+        ring_cells = [cc for cc, dd in visited.items() if dd == r_hop]
+        self._ring_cache[key] = ring_cells
+        return ring_cells
+
+# 块级均匀交叉（地形感知算法组件）
+class BlockUniformCrossover(Crossover):
+    def __init__(self, prob=0.9):
+        super().__init__(2, 2)
+        self.prob = float(prob)
+
+    def _do(self, problem, X, **kwargs):
+        rnd = kwargs.get("random_state", np.random)
+        n_matings = X.shape[1]
+        n_var = X.shape[2]
+        Y = np.empty((self.n_offsprings, n_matings, n_var), dtype=int)
+
+        for m in range(n_matings):
+            p1 = X[0, m].astype(int).copy()
+            p2 = X[1, m].astype(int).copy()
+            c1 = p1.copy()
+            c2 = p2.copy()
+
+            if float(rnd.random()) < self.prob:
+                for k in range(NUM_JAMMERS):
+                    if float(rnd.random()) < 0.5:
+                        a = k * 4
+                        b = a + 4
+                        tmp = c1[a:b].copy()
+                        c1[a:b] = c2[a:b]
+                        c2[a:b] = tmp
+
+            c1 = np.clip(c1, problem.xl, problem.xu).astype(int)
+            c2 = np.clip(c2, problem.xl, problem.xu).astype(int)
+            Y[0, m, :] = c1
+            Y[1, m, :] = c2
+
+        return Y
+
+# 拓扑多尺度变异（地形感知核心算法）
+class TopologyMutation(Mutation):
+    def __init__(self,
+                 p_mut_jammer=P_MUT_JAMMER,
+                 p_pos=P_MUT_POS,
+                 p_type=P_MUT_TYPE,
+                 p_ch=P_MUT_CH,
+                 p_pow=P_MUT_POW,
+                 scale_probs=POS_SCALE_PROBS):
+        super().__init__()
+        self.p_mut_jammer = float(p_mut_jammer)
+        self.p_pos = float(p_pos)
+        self.p_type = float(p_type)
+        self.p_ch = float(p_ch)
+        self.p_pow = float(p_pow)
+
+        sp = dict(scale_probs)
+        ssum = sum(float(v) for v in sp.values())
+        if ssum <= 0:
+            sp = {"r0": 0.25, "r1": 0.25, "r23": 0.30, "global": 0.20}
+            ssum = sum(sp.values())
+        for k in sp:
+            sp[k] = float(sp[k]) / float(ssum)
+        self.scale_probs = sp
+
+    def _sample_scale(self, rnd):
+        keys = ["r0", "r1", "r23", "global"]
+        ps = [self.scale_probs.get(k, 0.0) for k in keys]
+        return str(rnd.choice(keys, p=np.asarray(ps, dtype=float)))
+
+    @staticmethod
+    def _pick_tuple_list(rnd, items):
+        return items[rnd.integers(0, len(items))]
+
+    @staticmethod
+    def _mut_pow_idx(rnd, pow_idx, lo, hi):
+        pow_idx = int(pow_idx)
+        if float(rnd.random()) < 0.5:
+            pow_idx += 1
+        else:
+            pow_idx -= 1
+        return int(np.clip(pow_idx, lo, hi))
+
+    def _mut_pos_idx(self, problem, rnd, pos_idx):
+        pos_idx = int(pos_idx)
+
+        if (not hasattr(problem, "pos_to_cell")) or (pos_idx not in problem.pos_to_cell):
+            return rnd.integers(int(problem.pos_xl), int(problem.pos_xu) + 1)
+
+        cur_cell = problem.pos_to_cell[pos_idx]
+        scale = self._sample_scale(rnd)
+        target_cell = None
+
+        if scale == "r0":
+            target_cell = cur_cell
+        elif scale == "r1":
+            ring = problem.cell_graph.ring(cur_cell, 1)
+            if ring:
+                target_cell = self._pick_tuple_list(rnd, ring)
+            else:
+                target_cell = cur_cell
+        elif scale == "r23":
+            rr = 2 if float(rnd.random()) < 0.5 else 3
+            ring = problem.cell_graph.ring(cur_cell, rr)
+            if ring:
+                target_cell = self._pick_tuple_list(rnd, ring)
+            else:
+                ring2 = problem.cell_graph.ring(cur_cell, 2)
+                ring1 = problem.cell_graph.ring(cur_cell, 1)
+                if ring2:
+                    target_cell = self._pick_tuple_list(rnd, ring2)
+                elif ring1:
+                    target_cell = self._pick_tuple_list(rnd, ring1)
+                else:
+                    target_cell = cur_cell
+        else:
+            target_cell = None
+
+        if target_cell is None:
+            return rnd.integers(int(problem.pos_xl), int(problem.pos_xu) + 1)
+
+        cand_list = problem.cell_to_pos.get(target_cell, [])
+        if not cand_list:
+            return rnd.integers(int(problem.pos_xl), int(problem.pos_xu) + 1)
+
+        return int(rnd.choice(cand_list))
+
+    def _do(self, problem, X, **kwargs):
+        rnd = kwargs.get("random_state", np.random)
+        Y = X.astype(int).copy()
+        n, _ = Y.shape
+
+        pos_lo, pos_hi = int(problem.pos_xl), int(problem.pos_xu)
+        type_lo, type_hi = int(problem.type_xl), int(problem.type_xu)
+        ch_lo, ch_hi = int(problem.ch_xl), int(problem.ch_xu)
+        pow_lo, pow_hi = int(problem.pow_xl), int(problem.pow_xu)
+
+        for i in range(n):
+            for k in range(NUM_JAMMERS):
+                if float(rnd.random()) >= self.p_mut_jammer:
+                    continue
+
+                base = k * 4
+                if float(rnd.random()) < self.p_pos:
+                    Y[i, base + 0] = self._mut_pos_idx(problem, rnd, Y[i, base + 0])
+                if float(rnd.random()) < self.p_type:
+                    Y[i, base + 1] = int(1 - int(Y[i, base + 1]))
+                if float(rnd.random()) < self.p_ch:
+                    cur = int(Y[i, base + 2])
+                    if ch_hi > ch_lo:
+                        choices = list(range(ch_lo, ch_hi + 1))
+                        if cur in choices:
+                            choices.remove(cur)
+                        Y[i, base + 2] = int(rnd.choice(choices))
+                if float(rnd.random()) < self.p_pow:
+                    Y[i, base + 3] = self._mut_pow_idx(rnd, int(Y[i, base + 3]), pow_lo, pow_hi)
+
+        Y[:, 0::4] = np.clip(Y[:, 0::4], pos_lo, pos_hi)
+        Y[:, 1::4] = np.clip(Y[:, 1::4], type_lo, type_hi)
+        Y[:, 2::4] = np.clip(Y[:, 2::4], ch_lo, ch_hi)
+        Y[:, 3::4] = np.clip(Y[:, 3::4], pow_lo, pow_hi)
+        return Y.astype(int)
+
+# 优化问题定义
+class JammerOptimizationProblem(Problem):
+    def __init__(self, nodes_comm, jammer_cands, occupied, forbidden_all,
+                 dominant_links, terrain, model, rng):
+        self.nodes_comm = nodes_comm
+        self.jammer_cands = jammer_cands
+        self.occupied = occupied
+        self.forbidden_all = forbidden_all
+        self.dominant_links = dominant_links
+        self.terrain = terrain
+        self.model = model
+        self.rng = rng
+
+        n_var = NUM_JAMMERS * 4
+        xl = np.zeros(n_var, dtype=int)
+        xu = np.zeros(n_var, dtype=int)
+
+        for i in range(NUM_JAMMERS):
+            xl[i*4] = 0
+            xu[i*4] = len(jammer_cands) - 1
+            xl[i*4+1] = 0
+            xu[i*4+1] = 1
+            xl[i*4+2] = 0
+            xu[i*4+2] = len(CHANNELS) - 1
+            xl[i*4+3] = 0
+            xu[i*4+3] = 9
+
+        super().__init__(
+            n_var=n_var,
+            n_obj=4,
+            n_ieq_constr=1,
+            xl=xl,
+            xu=xu,
+            vtype=int
+        )
+
+        self.pos_xl, self.pos_xu = int(xl[0]), int(xu[0])
+        self.type_xl, self.type_xu = int(xl[1]), int(xu[1])
+        self.ch_xl, self.ch_xu = int(xl[2]), int(xu[2])
+        self.pow_xl, self.pow_xu = int(xl[3]), int(xu[3])
+
+        self.pos_to_cell = {}
+        self.cell_to_pos = {}
+        for idx, (_, _, _, row, col) in enumerate(self.jammer_cands):
+            cell = (int(row), int(col))
+            self.pos_to_cell[int(idx)] = cell
+            self.cell_to_pos.setdefault(cell, []).append(int(idx))
+
+        self.cell_graph = CellGraph(cell_set=self.cell_to_pos.keys(), deltas=HEX_NEI_DELTAS)
+
+    def _build_one_jammer(self, k, pos_idx, type_idx, ch_idx, pow_idx):
+        x_pos, y_pos, z_terrain, row, col = self.jammer_cands[pos_idx]
+        cell_id = (int(row), int(col))
+        jam_type = 'air' if int(type_idx) == 1 else 'ground'
+        ch = float(CHANNELS[int(ch_idx)])
+
+        level = int(pow_idx) + 1
+        if jam_type == 'air':
+            z = JAMMER_AIR_HEIGHT
+            power = float(level) * 1.0
+            power = min(power, P_AIR_MAX)
+        else:
+            z = JAMMER_GROUND_HEIGHT
+            power = float(level) * 2.0
+            power = min(power, P_GROUND_MAX)
+
+        return {
+            'id': f'J{k+1}',
+            'type': jam_type,
+            'x': float(x_pos),
+            'y': float(y_pos),
+            'z': float(z),
+            'ch': float(ch),
+            'power': float(power),
+            'cell_id': cell_id,
+            'valid_place': True
+        }
+
+    def _decode_solution(self, x):
+        jammers = []
+        used_cells = set()
+        for k in range(NUM_JAMMERS):
+            pos_idx = int(x[k*4])
+            type_idx = int(x[k*4+1])
+            ch_idx = int(x[k*4+2])
+            pow_idx = int(x[k*4+3])
+            jam = self._build_one_jammer(k, pos_idx, type_idx, ch_idx, pow_idx)
+            cell_id = jam['cell_id']
+
+            if cell_id in self.occupied or cell_id in self.forbidden_all or cell_id in used_cells:
+                jam['valid_place'] = False
+            else:
+                used_cells.add(cell_id)
+            jammers.append(jam)
+        return jammers
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        n_samples = X.shape[0]
+        F = np.zeros((n_samples, 4))
+        G = np.zeros((n_samples, 1))
+
+        for k in range(n_samples):
+            jammers_raw = self._decode_solution(X[k, :])
+            cv_dist = 0.0
+            n = len(jammers_raw)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if int(np.argmin([abs(float(jammers_raw[i]['ch']) - c) for c in CHANNELS])) == int(np.argmin([abs(float(jammers_raw[j]['ch']) - c) for c in CHANNELS])):
+                        dx = float(jammers_raw[i]["x"]) - float(jammers_raw[j]["x"])
+                        dy = float(jammers_raw[i]["y"]) - float(jammers_raw[j]["y"])
+                        dist_km = float(np.hypot(dx, dy)) * float(XY_TO_KM)
+                        if dist_km < MIN_SAME_CH_JAMMER_DIST:
+                            cv_dist += (MIN_SAME_CH_JAMMER_DIST - dist_km)
+            G[k, 0] = float(cv_dist)
+
+            jammers_eff = [j for j in jammers_raw if j.get('valid_place', True)]
+            link_results = []
+            for link in self.dominant_links:
+                tx, rx = link['tx'], link['rx']
+                S_dbm, dist_km = link['S_dbm'], link['dist_km']
+                lk = int(np.argmin([abs(link['ch'] - c) for c in CHANNELS]))
+                same_ch_jammers = [j for j in jammers_eff if int(np.argmin([abs(float(j['ch']) - c) for c in CHANNELS])) == lk]
+
+                if not same_ch_jammers:
+                    J_dbm, JSR_db = -np.inf, -np.inf
+                else:
+                    J_mW_total = 0.0
+                    for jam in same_ch_jammers:
+                        f0 = float(jam['ch'])
+                        jam_pos = self.terrain.create_position(float(jam['x']), float(jam['y']), float(jam['z']), frequency=f0)
+                        rx_pos = self.terrain.create_position(float(rx['x']), float(rx['y']), float(rx.get('z', 0.0)), frequency=f0)
+                        result = self.model.calculate_path_loss(jam_pos, rx_pos, add_shadow=ADD_SHADOW)
+                        L_total = float(result['L_total'])
+                        tx_dbm = 10 * np.log10(float(jam['power']) * 1000.0)
+                        gain_tx = J_GAIN_AIR if jam['type'] == 'air' else J_GAIN_GROUND
+                        gain_rx = GAIN_AIR if rx['type'] == 'air' else GAIN_GROUND
+                        j_rx_dbm = tx_dbm + gain_tx + gain_rx - L_total
+                        if np.isfinite(j_rx_dbm):
+                            J_mW_total += 10 ** (j_rx_dbm / 10.0)
+
+                    if J_mW_total <= 0.0:
+                        J_dbm, JSR_db = -np.inf, -np.inf
+                    else:
+                        J_dbm = 10 * np.log10(J_mW_total)
+                        JSR_db = J_dbm - S_dbm
+                link_results.append({'JSR_db': JSR_db})
+
+            suppr = sum(1 for r in link_results if np.isfinite(r['JSR_db']) and r['JSR_db'] >= JSR_THRESHOLD) / len(link_results) if link_results else 0.0
+
+            N_g = sum(1 for j in jammers_raw if j['type'] == 'ground')
+            N_a = sum(1 for j in jammers_raw if j['type'] == 'air')
+            C_raw = 2.0 * N_g + 1.0 * N_a
+            C_max = max(2.0, 1.0) * NUM_JAMMERS
+            c_norm = 0.0 if C_max <= 0 else float(np.clip(C_raw / C_max, 0.0, 1.0))
+            deploy_raw = 1.0 - c_norm
+
+            terms = []
+            for jam in jammers_raw:
+                if jam['type'] == 'ground':
+                    p_norm = float(jam['power']) / P_GROUND_MAX
+                    w = 2.0
+                else:
+                    p_norm = float(jam['power']) / P_AIR_MAX
+                    w = 1.2
+                p_norm = float(np.clip(p_norm, 0.0, 1.0))
+                terms.append(w * p_norm)
+            avg_term = float(np.mean(terms)) if terms else 0.0
+            worst_w = max(2.0, 1.2)
+            c_res = float(np.clip(avg_term / worst_w, 0.0, 1.0))
+            res_raw = 1.0 - c_res
+
+            R_ks = []
+            for jam in jammers_raw:
+                over_loud = False
+                visible_contribs = []
+                same_nodes = [n for n in self.nodes_comm if int(np.argmin([abs(float(n['ch']) - c) for c in CHANNELS])) == int(np.argmin([abs(float(jam['ch']) - c) for c in CHANNELS]))]
+                for node in same_nodes:
+                    f0 = float(jam['ch'])
+                    jam_pos = self.terrain.create_position(float(jam['x']), float(jam['y']), float(jam['z']), frequency=f0)
+                    rx_pos = self.terrain.create_position(float(node['x']), float(node['y']), float(node.get('z', 0.0)), frequency=f0)
+                    result = self.model.calculate_path_loss(jam_pos, rx_pos, add_shadow=ADD_SHADOW)
+                    L_total = float(result['L_total'])
+                    tx_dbm = 10 * np.log10(float(jam['power']) * 1000.0)
+                    gain_tx = J_GAIN_AIR if jam['type'] == 'air' else J_GAIN_GROUND
+                    gain_rx = GAIN_AIR if node['type'] == 'air' else GAIN_GROUND
+                    rx_dbm = tx_dbm + gain_tx + gain_rx - L_total
+
+                    dx = float(jam["x"]) - float(node["x"])
+                    dy = float(jam["y"]) - float(node["y"])
+                    dist_km = float(np.hypot(dx, dy)) * float(XY_TO_KM)
+
+                    if rx_dbm > -70.0:
+                        over_loud = True
+                        break
+                    if rx_dbm >= -80.0:
+                        margin_db = rx_dbm - (-80.0)
+                        denom = 10.0 if 10.0 != 0 else 1.0
+                        loud_norm = float(np.clip(margin_db / denom, 0.0, 1.0))
+                        if dist_km <= 4.0:
+                            w_d = 1.0
+                        elif dist_km >= 15.0:
+                            w_d = 0.2
+                        else:
+                            ratio = ((dist_km - 4.0) / (15.0 - 4.0))
+                            w_d = 1.0 - (1.0 - 0.2) * ratio
+                        visible_contribs.append(loud_norm * w_d)
+
+                if over_loud:
+                    R_node = 1.0
+                else:
+                    R_node = float(np.mean(visible_contribs)) if visible_contribs else 0.0
+                beta = 1.0 if jam['type'] == 'ground' else 1.5
+                R_ks.append(float(np.clip(R_node * beta, 0.0, 1.0)))
+            exposure_raw = float(np.mean(R_ks)) if R_ks else 0.0
+            stealth_raw = 1.0 - exposure_raw
+
+            deploy_eff = float(deploy_raw * suppr)
+            res_eff = float(res_raw * suppr)
+            stealth_eff = float(stealth_raw * suppr)
+
+            F[k, 0] = -suppr
+            F[k, 1] = -deploy_eff
+            F[k, 2] = -res_eff
+            F[k, 3] = -stealth_eff
+
+        out["F"] = F
+        out["G"] = G
+
+# 参考方向生成
+def make_ref_dirs(pop_size, n_obj, seed=42):
+    return get_reference_directions("energy", n_obj, n_points=pop_size, seed=seed)
+
+# 核心工具函数
+def load_comm_scenario(path="comm_scenario_natural.json"):
+    with open(path, "r", encoding="utf-8") as f:
+        scen = json.load(f)
+    nodes_comm = scen["nodes_comm"]
+    occupied = {tuple(c) for c in scen["occupied"]}
+    forbidden_all = {tuple(c) for c in scen["forbidden_all"]}
+    jammer_cands = [(c["x"], c["y"], c["z"], c["row"], c["col"]) for c in scen["jammer_cands"]]
+    return nodes_comm, occupied, forbidden_all, jammer_cands
+
+def build_dominant_links(nodes_comm, terrain, model):
+    nodes_by_key = {}
+    for n in nodes_comm:
+        k = int(np.argmin([abs(float(n['ch']) - c) for c in CHANNELS]))
+        nodes_by_key.setdefault(k, []).append(n)
+
+    links = []
+    for k in range(len(CHANNELS)):
+        ch_nodes = nodes_by_key.get(k, [])
+        if len(ch_nodes) < 2:
+            continue
+        for rx in ch_nodes:
+            best_tx, best_S, best_dist = None, -np.inf, 0.0
+            for tx in ch_nodes:
+                if str(tx['id']) == str(rx['id']):
+                    continue
+                f0 = float(tx['ch'])
+                tx_pos = terrain.create_position(float(tx['x']), float(tx['y']), float(tx.get('z', 0.0)), frequency=f0)
+                rx_pos = terrain.create_position(float(rx['x']), float(rx['y']), float(rx.get('z', 0.0)), frequency=f0)
+                result = model.calculate_path_loss(tx_pos, rx_pos, add_shadow=ADD_SHADOW)
+                L_total = float(result['L_total'])
+                tx_dbm = 10 * np.log10(float(tx['power']) * 1000.0)
+                gain_tx = GAIN_AIR if tx['type'] == 'air' else GAIN_GROUND
+                gain_rx = GAIN_AIR if rx['type'] == 'air' else GAIN_GROUND
+                S_dbm = tx_dbm + gain_tx + gain_rx - L_total
+                dist_km = float(result['distance_m']) / 1000.0
+                if S_dbm > best_S:
+                    best_S, best_tx, best_dist = S_dbm, tx, dist_km
+            if best_tx is not None:
+                links.append({
+                    'tx': best_tx, 'rx': rx, 'ch': float(CHANNELS[k]),
+                    'ch_key': int(k), 'S_dbm': float(best_S), 'dist_km': float(best_dist)
+                })
+    return links
+
+# 主程序
+def main():
+    rng = np.random.RandomState(RNG_SEED)
+    terrain = TerrainLoader("terrain_data.json")
+    model = ChannelModel(terrain)
+    nodes_comm, occupied, forbidden_all, jammer_cands = load_comm_scenario()
+    dominant_links = build_dominant_links(nodes_comm, terrain, model)
+
+    problem = JammerOptimizationProblem(
+        nodes_comm, jammer_cands, occupied, forbidden_all,
+        dominant_links, terrain, model, rng
+    )
+
+    ref_dirs = make_ref_dirs(pop_size=POP_SIZE, n_obj=problem.n_obj, seed=RNG_SEED)
+    algorithm = NSGA3(
+        pop_size=len(ref_dirs),
+        ref_dirs=ref_dirs,
+        sampling=LHS_TypeChPow_SamplingPaper(),
+        crossover=BlockUniformCrossover(prob=0.9),
+        mutation=TopologyMutation(),
+        eliminate_duplicates=False
+    )
+
+    res = minimize(
+        problem,
+        algorithm,
+        ('n_gen', N_GEN),
+        seed=RNG_SEED,
+        verbose=False
+    )
+
+    X_opt = res.X
+    if X_opt is not None:
+        X_opt = np.atleast_2d(X_opt)
+        G_opt = np.atleast_2d(res.G)
+        feas_p = np.all(G_opt <= 0.0, axis=1)
+        X_p = np.rint(X_opt[feas_p]).astype(int)
+        return X_p
+
+if __name__ == "__main__":
+    main()
